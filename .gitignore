@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+.venv/
+env/
+ENV/
+
+# OS specific
+.DS_Store
+
+# IDE directories
+.vscode/
+.idea/
+
+# Project specific
+# Ignore everything in glasir_auth_tool except get_auth.py
+glasir_auth_tool/*
+!glasir_auth_tool/get_auth.py
+
+# Debugging output
+debug_html/
+
+# Logs
+*.log
+
+# Profiling output
+profile_output.prof
+
+# Environment variables
+.env
