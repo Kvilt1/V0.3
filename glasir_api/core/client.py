@@ -1,11 +1,22 @@
 # glasir_api/core/client.py
 import asyncio
 import logging
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 import httpx
 from httpx import Limits
 
+class GlasirClientError(Exception):
+    """Base exception for client-related errors."""
+    def __init__(self, message: str, original_exception: Optional[Exception] = None):
+        super().__init__(message)
+        self.original_exception = original_exception
+
+    def __str__(self) -> str:
+        if self.original_exception:
+            return f"{super().__str__()} (Caused by: {type(self.original_exception).__name__}: {self.original_exception})"
+        return super().__str__()
 # Assuming ConcurrencyManager will be in the same directory or handled elsewhere
 # from .concurrency_manager import ConcurrencyManager
 # Placeholder type hint for now if ConcurrencyManager is not yet defined
@@ -290,3 +301,92 @@ class AsyncApiClient:
             force_max_concurrency=force_max_concurrency,
             **kwargs,
         )
+
+
+# --- New Structures and Functions ---
+
+# Removed FetchResult dataclass as it's no longer used by fetch_glasir_week_html
+
+
+async def fetch_glasir_week_html(
+    client: AsyncApiClient,
+    url: str,
+    cookies: Optional[Dict[str, str]] = None, # Keep for potential future use, but currently ignored
+    timeout: Optional[float] = None, # Use client's default if None
+) -> str: # Return HTML string directly
+    """
+    Fetches the HTML content for a specific week from Glasir using the provided client.
+
+    Args:
+        client: An initialized AsyncApiClient instance.
+        url: The specific URL to fetch (should include week offset parameters).
+        cookies: Optional cookies specific to this request (currently ignored, uses client's cookies).
+        timeout: Optional specific timeout for this request.
+
+    Returns:
+        The HTML content string on success (HTTP 200).
+
+    Raises:
+        GlasirClientError: If any HTTP error (non-200 status, timeout, connection error, etc.) occurs.
+    """
+    request_kwargs = {}
+    if timeout is not None:
+        request_kwargs['timeout'] = timeout
+    # Currently ignoring the 'cookies' parameter, relying on the client instance's cookies.
+    # See previous comments in the SEARCH block for rationale.
+
+    log.info(f"Attempting to fetch URL: {url}")
+    response: Optional[httpx.Response] = None
+    try:
+        # Step 1: Try to get a response using the client's method
+        # This part catches network/timeout/request errors from httpx
+        response = await client.get(url, **request_kwargs)
+
+    # Step 2: Handle specific httpx errors by wrapping them
+    except httpx.TimeoutException as e:
+        log.error(f"Timeout occurred while fetching {url}: {e}")
+        # // TDD Anchor: Test fetch timeout
+        raise GlasirClientError(f"Timeout occurred while fetching {url}", original_exception=e) from e
+    except httpx.ConnectError as e:
+        log.error(f"Connection error occurred while fetching {url}: {e}")
+        # // TDD Anchor: Test fetch connection error
+        raise GlasirClientError(f"Connection error occurred while fetching {url}", original_exception=e) from e
+    except httpx.HTTPStatusError as e:
+        # This catches non-2xx/3xx status codes if client.get raises them internally
+        log.error(f"HTTP status error occurred during fetch for {url}: {e.response.status_code} - {e}")
+        raise GlasirClientError(f"HTTP status error {e.response.status_code} for {url}", original_exception=e) from e
+    except httpx.RequestError as e:
+        # Catch other general httpx request errors
+        log.error(f"Request error occurred while fetching {url}: {e}")
+        raise GlasirClientError(f"Request error occurred while fetching {url}", original_exception=e) from e
+    except Exception as e:
+        # Catch any other unexpected errors during the fetch attempt itself
+        log.exception(f"An unexpected error occurred during the HTTP request for {url}: {e}")
+        # Use 'from e' to chain the exception correctly for __cause__
+        raise GlasirClientError(f"An unexpected error occurred during HTTP request for {url}: {e}", original_exception=e) from e
+
+    # Step 3: If we got a response (no httpx exception raised), check its status code
+    if response is None:
+        # This case should ideally not be reached if httpx raises correctly, but handle defensively
+        log.error(f"HTTP request for {url} completed without error but response object is None.")
+        # No original exception to chain here
+        raise GlasirClientError(f"Request completed without error but response was None for {url}")
+
+    if response.status_code != 200:
+        log.warning(f"Received non-200 status code {response.status_code} for {url}")
+        # // TDD Anchor: Test fetch non-200 status (e.g., 404, 500)
+        # Manually create an HTTPStatusError to wrap in GlasirClientError
+        status_error = httpx.HTTPStatusError(
+            f"Server returned status code {response.status_code}",
+            request=response.request,
+            response=response
+        )
+        # Raise the specific error for non-200 status, using 'from status_error' to set __cause__
+        raise GlasirClientError(
+            f"HTTP error {response.status_code} while fetching {url}",
+            original_exception=status_error
+        ) from status_error # Chain the original HTTPStatusError
+
+    # // TDD Anchor: Test fetch success (200 OK)
+    log.info(f"Successfully fetched {url} (Status: 200)")
+    return response.text # Return HTML content directly

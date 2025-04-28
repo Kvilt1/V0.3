@@ -1,79 +1,175 @@
-import httpx
 import asyncio
 import logging
-from typing import Dict, Tuple, Optional, List # Added List
+from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime
-from fastapi import HTTPException # Added HTTPException
-from pydantic import ValidationError # Added ValidationError
+from typing import Any, Dict, List, Optional, Tuple
+
+import databases
+import httpx
+from fastapi import HTTPException
+from pydantic import ValidationError
 
 # Core module imports (using relative paths)
-from .client import AsyncApiClient
-from .constants import GLASIR_TIMETABLE_URL, GLASIR_BASE_URL # Import GLASIR_BASE_URL
-# Removed incorrect import: from .date_utils import generate_timestamp_timer
+from .cache_service import (get_teacher_map_from_db,
+                            update_teacher_cache_in_db)
+from .client import AsyncApiClient,  fetch_glasir_week_html
+from .client import AsyncApiClient, fetch_glasir_week_html, GlasirClientError # Added GlasirClientError
+from .constants import GLASIR_BASE_URL, GLASIR_TIMETABLE_URL
 from .extractor import TimetableExtractor
-from .parsers import parse_timetable_html, merge_homework_into_events # Assuming these exist from Phase 0
-from .session import extract_session_params_from_html # Assuming this exists from Phase 0
+from .parsers import ( merge_homework_into_events,
+                      parse_week_html, GlasirParserError) # Added GlasirParserError
+from .session import extract_session_params_from_html
 
 # Model import
-from ..models.models import TimetableData # Corrected to relative import
+from ..models.models import Event, StudentInfo, TimetableData, WeekInfo # Import necessary models
 
 # Setup module logger
 log = logging.getLogger(__name__)
 
-async def _fetch_and_process_week(offset: int, extractor: TimetableExtractor, student_id: str, teacher_map: dict) -> Optional[Dict]:
+# --- Removed Global In-Memory Cache ---
+
+@dataclass
+class WeekDataResult:
+    """Represents the final result of fetching and parsing data for a single week."""
+    status: str # e.g., 'SuccessWithData', 'SuccessNoData', 'FetchFailed', 'ParseFailed'
+    data: Optional[TimetableData] = None # The final validated timetable data
+    fetch_error_type: Optional[str] = None
+    parse_error_type: Optional[str] = None # Corresponds to ParseResult.status when failed
+    error_message: Optional[str] = None
+    http_status_code: Optional[int] = None
+    warnings: List[str] = field(default_factory=list) # Collect warnings from parsing
+
+
+async def fetch_and_parse_single_week(
+    offset: int,
+    extractor: TimetableExtractor,
+    student_id: str,
+    teacher_map: Optional[Dict[str, str]] = None
+) -> WeekDataResult: # Return the structured result object
     """
-    Fetches timetable HTML for a specific week, parses it, fetches related homework,
-    and merges the homework data into the timetable events.
+    Fetches and parses timetable data for a single week offset using the provided extractor.
 
     Args:
         offset: The week offset to fetch.
         extractor: An initialized TimetableExtractor instance.
         student_id: The student's ID.
-        teacher_map: A dictionary mapping teacher initials to full names.
+        teacher_map: Optional dictionary mapping teacher initials to full names for parsing.
 
     Returns:
-        A dictionary containing the processed timetable data for the week,
-        or None if fetching or parsing fails.
+        A WeekDataResult object containing the status, data, and any errors/warnings.
     """
+    html_content: Optional[str] = None
+    parse_result: Optional[Any] = None # Placeholder for ParseResult type if defined
+    timetable_data: Optional[TimetableData] = None
+    warnings: List[str] = []
+
     try:
-        week_html = await extractor.fetch_week_html(offset, student_id)
-        if not week_html:
-            log.warning(f"No HTML content received for week offset {offset}, student {student_id}.")
-            return None
+        # 1. Fetch HTML using the extractor
+        log.debug(f"Service: Fetching HTML for offset {offset} using extractor...")
+        html_content = await extractor.fetch_week_html(offset=offset, student_id=student_id)
+        if html_content is None:
+            # fetch_week_html should ideally raise on failure, but handle None defensively
+            log.error(f"Service: fetch_week_html returned None for offset {offset}.")
+            # Determine appropriate error based on extractor's internal state if possible
+            return WeekDataResult(status='FetchFailed', error_message="Extractor failed to fetch HTML (returned None).")
 
-        timetable_data, homework_ids = parse_timetable_html(week_html, teacher_map)
-        if not timetable_data:
-            log.warning(f"Failed to parse timetable data for week offset {offset}, student {student_id}.")
-            return None
+        log.debug(f"Service: Successfully fetched HTML for offset {offset}.")
 
-        if homework_ids:
-            homework_map = await extractor.fetch_homework_for_lessons(homework_ids, student_id)
-            if homework_map: # Only merge if homework was successfully fetched
-                merge_homework_into_events(timetable_data['events'], homework_map)
-            else:
-                log.warning(f"Failed to fetch homework details for week offset {offset}, student {student_id}. Proceeding without homework.")
+        # 2. Parse HTML
+        log.debug(f"Service: Parsing HTML for offset {offset}...")
+        # parse_week_html now returns a ParseResult object
+        parse_result = parse_week_html(html_content, teacher_map)
+        warnings.extend(parse_result.warnings) # Collect warnings
 
-        return timetable_data
+        if parse_result.status == 'Success':
+            log.debug(f"Service: Successfully parsed HTML for offset {offset}.")
+            parsed_dict = parse_result.data or {} # Use empty dict if data is None
 
-    except httpx.RequestError as e:
-        log.error(f"Network error fetching week {offset} for student {student_id}: {e.request.url}", exc_info=True)
-        return None # Keep returning None for concurrent handling
-    except httpx.HTTPStatusError as e:
-        log.error(f"HTTP error {e.response.status_code} fetching week {offset} for student {student_id}: {e.request.url}", exc_info=True)
-        return None # Keep returning None
+            # 3. Validate and structure data using Pydantic model
+            try:
+                # Extract student info from the parsed data, providing defaults if missing
+                # Ensure student_info exists in the parsed_dict before accessing it
+                student_info_parsed = parsed_dict.get('student_info', {})
+                student_name = student_info_parsed.get('studentName', None)
+                student_class = student_info_parsed.get('class', None)
+
+                # Create StudentInfo object - validation happens here
+                student_info_obj = StudentInfo(
+                    studentName=student_name, # Use Pydantic field name
+                    class_=student_class      # Use Pydantic field name
+                )
+
+                # Extract week info from the parsed data
+                week_info_parsed = parsed_dict.get('week_info', {})
+                week_number = week_info_parsed.get('weekNumber')
+                start_date = week_info_parsed.get('startDate')
+                end_date = week_info_parsed.get('endDate')
+                year = week_info_parsed.get('year')
+
+                # Create WeekInfo object - validation happens here
+                week_info_obj = WeekInfo(
+                    weekNumber=week_number, # Use Pydantic field name
+                    startDate=start_date,   # Use Pydantic field name
+                    endDate=end_date,     # Use Pydantic field name
+                    year=year,
+                    offset=offset # Pass the original offset
+                    # weekKey is generated by model_validator
+                )
+
+                # Extract events list - it should already contain Event objects from the parser
+                events_parsed = parsed_dict.get('events', [])
+                # No need to re-validate here if parser already creates Event objects
+                events_obj_list = events_parsed # Directly use the list from the parser
+
+                # Assemble the final TimetableData
+                timetable_data = TimetableData(
+                    studentInfo=student_info_obj, # Use Pydantic field name
+                    weekInfo=week_info_obj,       # Use Pydantic field name
+                    events=events_obj_list
+                    # formatVersion defaults to 2
+                )
+
+                log.debug(f"Service: Successfully validated TimetableData for offset {offset}.")
+                status = 'SuccessWithData' if timetable_data.events else 'SuccessNoData'
+                return WeekDataResult(status=status, data=timetable_data, warnings=warnings)
+
+            except ValidationError as e:
+                # Log the specific validation error and the problematic data structure
+                log.error(f"Service: Pydantic validation failed for offset {offset}: {e}", exc_info=True)
+                log.debug(f"Service: Data causing validation error for offset {offset}: {parsed_dict}") # Log the raw data
+                return WeekDataResult(status='ParseFailed', parse_error_type='ValidationError', error_message=str(e), warnings=warnings)
+            except Exception as e: # Catch other potential errors during structuring
+                 log.error(f"Service: Unexpected error structuring TimetableData for offset {offset}: {e}", exc_info=True)
+                 return WeekDataResult(status='ParseFailed', parse_error_type='StructureError', error_message=f"Unexpected error: {e}", warnings=warnings)
+
+        else: # Parse failed (status was not 'Success')
+            log.error(f"Service: parse_week_html failed for offset {offset}. Status: {parse_result.status}, Error: {parse_result.error_message}")
+            return WeekDataResult(status='ParseFailed', parse_error_type=parse_result.status, error_message=parse_result.error_message, warnings=warnings)
+
+    except GlasirClientError as e:
+        log.error(f"Service: Client error fetching offset {offset}: {e}", exc_info=True)
+        return WeekDataResult(status='FetchFailed', fetch_error_type=type(e).__name__, http_status_code=e.status_code, error_message=str(e), warnings=warnings)
+
+    except GlasirParserError as e: # Should be caught by ParseResult handling above, but keep defensively
+        log.error(f"Service: Parser error processing offset {offset}: {e}", exc_info=True)
+        return WeekDataResult(status='ParseFailed', parse_error_type=type(e).__name__, error_message=str(e), warnings=warnings)
+
     except Exception as e:
-        log.error(f"Unexpected error processing week {offset} for student {student_id}", exc_info=True)
-        return None # Keep returning None
+        # Catch-all for unexpected errors during service logic
+        log.exception(f"Service: Unexpected error processing offset {offset}: {e}")
+        return WeekDataResult(status='FetchFailed', fetch_error_type='UnexpectedServiceError', error_message=str(e), warnings=warnings)
 
 
-async def _setup_extractor(cookies_str: str, shared_client: httpx.AsyncClient) -> Tuple[TimetableExtractor, dict, str]: # Return type changed
+async def _setup_extractor(cookies_list: List[Dict[str, Any]], shared_client: httpx.AsyncClient, db: databases.Database) -> Tuple[TimetableExtractor, dict, str]: # Added db param
     """
-    Sets up the TimetableExtractor using provided cookies and a shared HTTP client.
-    Fetches initial session parameters (lname) and the teacher map using the shared client.
+    Sets up the TimetableExtractor using provided cookies, a shared HTTP client, and a database connection.
+    Fetches initial session parameters (lname) and the teacher map (using DB cache) via the shared client.
 
     Args:
-        cookies_str: The raw cookie string from the request header.
+        cookies_list: A list of cookie dictionaries, typically [{'name': ..., 'value': ...}].
         shared_client: The pre-configured httpx.AsyncClient managed by the application lifespan.
+        db: The database connection instance. # Added missing db param description
 
     Returns:
         A tuple containing the initialized TimetableExtractor, the teacher map, and the extracted lname.
@@ -82,17 +178,19 @@ async def _setup_extractor(cookies_str: str, shared_client: httpx.AsyncClient) -
     """
     # api_client: Optional[AsyncApiClient] = None # No longer needed here
     try:
-        # 1. Parse cookies
+        # 1. Parse cookies from the list of dictionaries
         parsed_cookies = {}
-        if cookies_str:
-            for item in cookies_str.split(';'):
-                item = item.strip()
-                if '=' in item:
-                    key, value = item.split('=', 1)
-                    parsed_cookies[key.strip()] = value.strip()
+        if cookies_list:
+            for cookie_dict in cookies_list:
+                name = cookie_dict.get('name')
+                value = cookie_dict.get('value')
+                # Ensure both name and value are present and are strings (or convert if needed)
+                if name and value is not None:
+                    # httpx expects cookies as Dict[str, str]
+                    parsed_cookies[str(name)] = str(value)
         if not parsed_cookies:
-            log.error("Invalid or empty cookie string provided during setup.")
-            raise HTTPException(status_code=400, detail="Invalid or missing authentication cookie provided.")
+            log.error("Invalid or empty cookie list provided, or failed to parse cookies during setup.")
+            raise HTTPException(status_code=400, detail="Invalid, empty, or unparseable authentication cookies provided.")
 
         # 2. Fetch initial HTML for session params using the shared client
         # Pass cookies specifically for this request, don't modify shared client's default cookies
@@ -127,11 +225,29 @@ async def _setup_extractor(cookies_str: str, shared_client: httpx.AsyncClient) -
         # Pass lname to the extractor constructor
         extractor = TimetableExtractor(api_client, lname=lname) # Pass lname here
 
-        # 5. Fetch teacher map
-        teacher_map = await extractor.fetch_teacher_map() # fetch_teacher_map will now handle its own timer/lname
-        if teacher_map is None: # Check explicitly for None, as empty dict might be valid
-             log.error("Failed to fetch teacher map during setup.")
-             raise HTTPException(status_code=502, detail="Failed to fetch teacher map from Glasir.")
+        # 5. Fetch teacher map (using DB cache)
+        log.info("Attempting to retrieve teacher map from DB cache...")
+        teacher_map = await get_teacher_map_from_db(db)
+
+        if teacher_map is None:
+            log.info("Teacher map not found in DB cache or expired. Fetching from Glasir...")
+            try:
+                fetched_map = await extractor.fetch_teacher_map()
+                if fetched_map is None: # Check explicitly for None
+                    log.error("Failed to fetch teacher map during setup (returned None).")
+                    raise HTTPException(status_code=502, detail="Failed to fetch teacher map from Glasir.")
+                else:
+                    log.info(f"Successfully fetched teacher map from Glasir. Map size: {len(fetched_map)}. Updating DB cache...")
+                    # Update cache in the background? For now, await it.
+                    await update_teacher_cache_in_db(db, fetched_map)
+                    log.info("DB cache updated successfully.")
+                    teacher_map = fetched_map # Use the newly fetched map
+            except Exception as fetch_exc:
+                # Catch potential errors during the fetch or cache update
+                log.error(f"Error fetching teacher map or updating cache: {fetch_exc}", exc_info=True)
+                raise HTTPException(status_code=502, detail=f"Failed to fetch teacher map from Glasir or update cache: {fetch_exc}")
+        else:
+            log.info("Teacher map successfully retrieved from DB cache.")
 
         # 6. Return extractor, teacher map, and lname
         return extractor, teacher_map, lname # Return lname as well
@@ -149,22 +265,24 @@ async def _setup_extractor(cookies_str: str, shared_client: httpx.AsyncClient) -
 
 # --- Multi-Week Service ---
 
-async def get_multiple_weeks(
-    username: str, # Keep username for potential future use/logging
+async def get_multiple_weeks( # Added db param
+    username: str,
     student_id: str,
-    cookies_str: str,
+    cookies_list: List[Dict[str, Any]], # Changed from cookies_str
     requested_offsets: List[int],
-    shared_client: httpx.AsyncClient # Accept the shared client
+    shared_client: httpx.AsyncClient,
+    db: databases.Database
 ) -> List[TimetableData]:
     """
-    Fetches and processes timetable data for multiple specified week offsets concurrently.
+    Fetches and processes timetable data for multiple specified week offsets concurrently, using DB cache.
 
     Args:
         username: The username associated with the request (for logging/context).
         student_id: The student's ID required for fetching data.
-        cookies_str: The raw cookie string for authentication.
+        cookies_list: A list of cookie dictionaries for authentication.
         requested_offsets: A list of integer week offsets to fetch.
         shared_client: The shared httpx.AsyncClient managed by the application lifespan.
+        db: The database connection instance.
 
     Returns:
         A list of validated TimetableData objects, sorted by week number.
@@ -180,7 +298,7 @@ async def get_multiple_weeks(
     try:
         # 1. Setup Extractor using the shared client
         # _setup_extractor now raises exceptions on failure, caught by outer try/except
-        extractor, teacher_map, lname = await _setup_extractor(cookies_str, shared_client)
+        extractor, teacher_map, lname = await _setup_extractor(cookies_list, shared_client, db) # Pass db and cookies_list
         log.info(f"Extractor setup successful for user {username}, lname: {lname}")
 
         # 2. Create concurrent tasks for fetching each week
@@ -191,9 +309,9 @@ async def get_multiple_weeks(
 
         log.info(f"Creating {len(requested_offsets)} tasks for offsets: {requested_offsets}")
         for offset in requested_offsets:
-            # Pass necessary arguments to the worker function
+            # Pass necessary arguments to the new worker function
             task = asyncio.create_task(
-                _fetch_and_process_week(offset, extractor, student_id, teacher_map)
+                fetch_and_parse_single_week(offset, extractor, student_id, teacher_map)
             )
             tasks.append(task)
 
@@ -202,34 +320,74 @@ async def get_multiple_weeks(
         results = await asyncio.gather(*tasks, return_exceptions=True)
         log.info(f"Finished gathering results for {len(results)} tasks.")
 
-        # 4. Process results and validate data
-        for i, result in enumerate(results):
-            offset = requested_offsets[i] # Get corresponding offset for logging
-            if isinstance(result, Exception):
-                # Log exceptions returned by asyncio.gather
-                log.error(f"Task for offset {offset} failed with exception: {result}", exc_info=result)
-                # Optionally: Collect errors to return details? For now, just log.
-            elif result is None:
-                # Log cases where _fetch_and_process_week returned None (internal error)
-                log.warning(f"Task for offset {offset} returned None (fetch/parse error).")
-            else:
-                # Attempt to validate the dictionary result with Pydantic model
-                try:
-                    validated_data = TimetableData.model_validate(result)
-                    processed_weeks.append(validated_data)
-                    log.debug(f"Successfully validated and added data for offset {offset}.")
-                except ValidationError as e:
-                    log.error(f"Validation failed for offset {offset}: {e}")
-                    # Log the problematic data structure for debugging
-                    log.debug(f"Invalid data structure for offset {offset}: {result}")
-                except Exception as e_val:
-                    # Catch any other unexpected errors during validation/append
-                    log.error(f"Unexpected error processing result for offset {offset}: {e_val}", exc_info=True)
+        # 4. Process results, validate data, and collect errors/warnings
+        failed_offsets = defaultdict(list) # Key: (error_type, error_message), Value: list of offsets
+        warning_summary = defaultdict(list) # Key: warning_message, Value: list of offsets
+        task_exceptions = defaultdict(list) # Key: exception_type_str, Value: list of offsets
 
-        # 5. Sort results by week number
-        # Use a lambda function with a default value for sorting robustness
-        processed_weeks.sort(key=lambda x: x.week_info.week_number if x.week_info and x.week_info.week_number is not None else float('inf')) # Corrected: week_info
-        log.info(f"Successfully processed and validated {len(processed_weeks)} weeks out of {len(requested_offsets)} requested.")
+        for i, result in enumerate(results):
+            offset = requested_offsets[i] # Get corresponding offset
+
+            if isinstance(result, Exception):
+                exc_type_str = type(result).__name__
+                task_exceptions[exc_type_str].append(offset)
+                # Log the first occurrence verbosely for debugging context if needed
+                if len(task_exceptions[exc_type_str]) == 1:
+                     log.error(f"Task for offset {offset} failed with {exc_type_str}: {result}", exc_info=result)
+                else:
+                     log.debug(f"Task for offset {offset} failed with {exc_type_str} (repeated).")
+
+            elif isinstance(result, WeekDataResult):
+                # Collect warnings regardless of status
+                for warning in result.warnings:
+                    warning_summary[warning].append(offset)
+
+                # Process based on status
+                if result.status == 'SuccessWithData' or result.status == 'SuccessNoData':
+                    if result.data:
+                        processed_weeks.append(result.data)
+                    # No error logging needed for success cases here
+                elif result.status == 'FetchFailed':
+                    error_key = (result.fetch_error_type or "UnknownFetchError", result.error_message or "N/A")
+                    failed_offsets[error_key].append(offset)
+                elif result.status == 'ParseFailed':
+                    error_key = (result.parse_error_type or "UnknownParseError", result.error_message or "N/A")
+                    failed_offsets[error_key].append(offset)
+                else:
+                    # Unknown status from WeekDataResult
+                    error_key = ("UnknownStatus", f"Status: {result.status}, Msg: {result.error_message or 'N/A'}")
+                    failed_offsets[error_key].append(offset)
+            else:
+                # Should not happen
+                error_key = ("UnexpectedResultType", f"Type: {type(result)}")
+                failed_offsets[error_key].append(offset)
+
+        # 5. Log Summary
+        total_requested = len(requested_offsets)
+        total_successful = len(processed_weeks)
+        total_failed = total_requested - total_successful
+        log.info(f"Multi-week processing summary: Requested={total_requested}, Successful={total_successful}, Failed={total_failed}")
+
+        if task_exceptions:
+            log.warning("Summary of task exceptions during gather:")
+            for exc_type, offsets in task_exceptions.items():
+                log.warning(f"  - Exception Type '{exc_type}' occurred for offsets: {sorted(list(set(offsets)))}")
+
+        if failed_offsets:
+            log.warning("Summary of failed week offsets:")
+            for (error_type, error_msg), offsets in failed_offsets.items():
+                 # Truncate long error messages for summary
+                 truncated_msg = (error_msg[:150] + '...') if error_msg and len(error_msg) > 150 else error_msg
+                 log.warning(f"  - Type='{error_type}', Msg='{truncated_msg}': Offsets {sorted(list(set(offsets)))}")
+
+        if warning_summary:
+            log.warning("Summary of warnings encountered:")
+            for warning, offsets in warning_summary.items():
+                 truncated_warning = (warning[:150] + '...') if len(warning) > 150 else warning
+                 log.warning(f"  - Warning='{truncated_warning}': Offsets {sorted(list(set(offsets)))}")
+
+        # 6. Sort successful results by week number
+        processed_weeks.sort(key=lambda x: x.week_info.week_number if x.week_info and x.week_info.week_number is not None else float('inf'))
 
         return processed_weeks
 

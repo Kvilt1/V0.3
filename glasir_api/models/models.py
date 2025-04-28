@@ -17,6 +17,7 @@ class WeekInfo(BaseModel):
     start_date: str = Field(..., alias="startDate")
     end_date: str = Field(..., alias="endDate")
     year: int
+    offset: Optional[int] = None # Added offset field
     week_key: Optional[str] = Field(None, alias="weekKey")
 
     @validator("start_date", "end_date")
@@ -48,6 +49,7 @@ class WeekInfo(BaseModel):
                 "startDate": "2025-03-24",
                 "endDate": "2025-03-30",
                 "year": 2025,
+                "offset": 0, # Added example for offset
                 "weekKey": "2025-W13",
             }
         }

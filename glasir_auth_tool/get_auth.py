@@ -4,46 +4,33 @@
 import asyncio
 import re
 import json
-import os
 import argparse
 from pathlib import Path
+from typing import Optional, Tuple, List, Dict, Any
 from playwright.async_api import async_playwright, Error as PlaywrightError
 import httpx
-import aiofiles # Import aiofiles
+import aiofiles
 
 # --- Constants ---
 SCRIPT_DIR = Path(__file__).parent.resolve()
-USERNAME_FILE = SCRIPT_DIR / "username.txt"
 COOKIES_FILE = SCRIPT_DIR / "cookies.json"
 STUDENT_ID_FILE = SCRIPT_DIR / "student_id.txt"
-# API_RESPONSE_FILE = SCRIPT_DIR / "api_response.json" # No longer a single constant file
+ACCESS_CODE_FILE = SCRIPT_DIR / "access_code.txt"
 
 # Regex to find the student GUID in the page content
 _RE_GUID = re.compile(
     r"[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}"
 )
 
-# --- Helper Functions ---
+API_BASE = "http://127.0.0.1:8000"
 
-async def load_data():
-    """Loads existing authentication data from files."""
-    username = None
-    cookies = None
+# --- Data Storage Helpers ---
+
+async def load_data() -> Tuple[Optional[str], Optional[List[Dict[str, Any]]], Optional[str]]:
+    """Loads student_id, cookies, and access_code from local files."""
     student_id = None
-
-    if USERNAME_FILE.exists():
-        try:
-            async with aiofiles.open(USERNAME_FILE, "r") as f:
-                username = (await f.read()).strip()
-        except Exception as e:
-            print(f"Warning: Could not read username file: {e}")
-
-    if COOKIES_FILE.exists():
-        try:
-            async with aiofiles.open(COOKIES_FILE, "r") as f:
-                cookies = json.loads(await f.read()) # Load as JSON object
-        except Exception as e:
-            print(f"Warning: Could not read or parse cookies file: {e}")
+    cookies = None
+    access_code = None
 
     if STUDENT_ID_FILE.exists():
         try:
@@ -52,44 +39,57 @@ async def load_data():
         except Exception as e:
             print(f"Warning: Could not read student ID file: {e}")
 
-    return username, cookies, student_id
+    if COOKIES_FILE.exists():
+        try:
+            async with aiofiles.open(COOKIES_FILE, "r") as f:
+                cookies = json.loads(await f.read())
+        except Exception as e:
+            print(f"Warning: Could not read or parse cookies file: {e}")
 
-async def save_data(username: str, cookies: list, student_id: str):
-    """Saves authentication data to files."""
-    try:
-        async with aiofiles.open(USERNAME_FILE, "w") as f:
-            await f.write(username)
-    except Exception as e:
-        print(f"Error saving username: {e}")
+    if ACCESS_CODE_FILE.exists():
+        try:
+            async with aiofiles.open(ACCESS_CODE_FILE, "r") as f:
+                access_code = (await f.read()).strip()
+        except Exception as e:
+            print(f"Warning: Could not read access code file: {e}")
 
-    try:
-        async with aiofiles.open(COOKIES_FILE, "w") as f:
-            await f.write(json.dumps(cookies, indent=2)) # Save as JSON object
-    except Exception as e:
-        print(f"Error saving cookies: {e}")
+    return student_id, cookies, access_code
 
+async def save_data(student_id: str, cookies: List[Dict[str, Any]], access_code: str) -> None:
+    """Saves student_id, cookies, and access_code to local files."""
     try:
         async with aiofiles.open(STUDENT_ID_FILE, "w") as f:
             await f.write(student_id)
     except Exception as e:
         print(f"Error saving student ID: {e}")
 
-async def perform_playwright_login():
-    """Handles the Playwright login process and data extraction."""
-    username = None
+    try:
+        async with aiofiles.open(COOKIES_FILE, "w") as f:
+            await f.write(json.dumps(cookies, indent=2))
+    except Exception as e:
+        print(f"Error saving cookies: {e}")
+
+    try:
+        async with aiofiles.open(ACCESS_CODE_FILE, "w") as f:
+            await f.write(access_code)
+    except Exception as e:
+        print(f"Error saving access code: {e}")
+
+# --- Playwright Login and Initial Sync ---
+
+async def perform_playwright_login_and_initial_sync() -> Tuple[Optional[str], Optional[List[Dict[str, Any]]], Optional[str]]:
+    """
+    Launches Playwright for user login, extracts student_id and cookies,
+    then calls /sync/initial to obtain access_code. Saves all three.
+    """
     cookies = None
     student_id = None
+    access_code = None
 
     async with async_playwright() as p:
         browser = None
         try:
-            # --- User Input ---
-            username_input = input("Please enter your Glasir username: ").strip()
-            if not username_input:
-                print("Username cannot be empty. Exiting.")
-                return None, None, None # Indicate failure
-
-            print("Launching browser...")
+            print("Launching browser for Glasir login...")
             browser = await p.chromium.launch(headless=False)
             context = await browser.new_context()
             page = await context.new_page()
@@ -109,55 +109,159 @@ async def perform_playwright_login():
             await page.wait_for_selector("table.time_8_16", state="visible", timeout=0)
             print("Timetable table detected. Extracting data...")
 
-            cookies = await context.cookies() # Get cookies as list of dicts
+            cookies = await context.cookies()
             content = await page.content()
             guid_match = _RE_GUID.search(content)
             student_id = guid_match.group(0).strip() if guid_match else None
 
             if cookies and student_id:
                 print("Playwright login and data extraction successful.")
-                username = username_input # Use the username provided by the user
-                await save_data(username, cookies, student_id) # Save the extracted data
+                print("Calling /sync/initial to obtain access code...")
+                access_code = await call_initial_sync(student_id, cookies)
+                if access_code:
+                    await save_data(student_id, cookies, access_code)
+                    print("Initial sync successful. Data saved.")
+                else:
+                    print("Initial sync failed. Could not obtain access code.")
             else:
                 print("Error: Could not extract cookies or student ID after login.")
-                return None, None, None # Indicate failure
+                return None, None, None
 
         except PlaywrightError as e:
             print(f"\nAn error occurred during Playwright operation: {e}")
-            return None, None, None # Indicate failure
+            return None, None, None
         except Exception as e:
             print(f"\nAn unexpected error occurred during Playwright login: {e}")
-            return None, None, None # Indicate failure
+            return None, None, None
         finally:
             if browser:
                 await browser.close()
             print("Browser closed.")
 
-    return username, cookies, student_id
+    return student_id, cookies, access_code
 
-async def make_api_call(username: str, cookies: list, student_id: str, endpoint: str):
-    """Makes the API call to the specified endpoint using the provided auth data."""
-    if not all([username, cookies, student_id]):
+async def call_initial_sync(student_id: str, cookies: List[Dict[str, Any]]) -> Optional[str]:
+    """
+    Calls the /sync/initial API endpoint with student_id and cookies.
+    Returns the access_code if successful, else None.
+    """
+    url = f"{API_BASE}/sync/initial"
+    payload = {
+        "student_id": student_id,
+        "cookies": cookies
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, json=payload, timeout=30.0)
+            if resp.status_code == 201:
+                data = resp.json()
+                access_code = data.get("access_code")
+                if access_code:
+                    print("Received access code from /sync/initial.")
+                    return access_code
+                else:
+                    print("No access_code in response.")
+            elif resp.status_code == 401:
+                print("Initial sync failed: Invalid cookies (401).")
+            elif resp.status_code == 409:
+                print("Initial sync failed: User already exists (409).")
+            else:
+                print(f"Initial sync failed: {resp.status_code} {resp.text}")
+    except httpx.RequestError as exc:
+        print(f"Network error during initial sync: {exc}")
+    except Exception as e:
+        print(f"Unexpected error during initial sync: {e}")
+    return None
+
+# --- Session Refresh Logic ---
+
+async def perform_session_refresh(student_id: str) -> bool:
+    """
+    Refreshes the session by obtaining new cookies and calling /session/refresh.
+    Returns True on success, False on failure.
+    """
+    print("Refreshing session: launching browser to obtain new cookies.")
+    # Option A: Use Playwright to get new cookies
+    cookies = None
+    async with async_playwright() as p:
+        browser = None
+        try:
+            browser = await p.chromium.launch(headless=False)
+            context = await browser.new_context()
+            page = await context.new_page()
+            print("Navigate to Glasir and log in if needed, then go to your timetable page.")
+            await page.goto("https://tg.glasir.fo", timeout=60000)
+            await page.wait_for_url("https://tg.glasir.fo/132n/**", timeout=0)
+            await page.wait_for_selector("table.time_8_16", state="visible", timeout=0)
+            cookies = await context.cookies()
+        except Exception as e:
+            print(f"Error during Playwright session refresh: {e}")
+        finally:
+            if browser:
+                await browser.close()
+            print("Browser closed after refresh.")
+
+    if not cookies:
+        print("Failed to obtain new cookies for session refresh.")
+        return False
+
+    # Add a dummy query parameter 'req=refresh_session' to satisfy potential validation
+    url = f"{API_BASE}/session/refresh?req=refresh_session"
+    # Serialize the cookies list into a JSON string to match the API model expectation
+    cookies_json_string = json.dumps(cookies)
+    payload = {
+        "student_id": student_id,
+        "new_cookies": cookies_json_string # Send the JSON string
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            # Send the payload as JSON. FastAPI will parse the JSON body,
+            # and Pydantic will validate the 'new_cookies' field as a string.
+            resp = await client.post(url, json=payload, timeout=30.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                new_access_code = data.get("access_code") or data.get("new_access_code")
+                if new_access_code:
+                    await save_data(student_id, cookies, new_access_code)
+                    print("Session refresh successful. Data updated.")
+                    return True
+                else:
+                    print("No access_code in refresh response.")
+            elif resp.status_code == 401:
+                print("Session refresh failed: Invalid new cookies (401).")
+            elif resp.status_code == 404:
+                print("Session refresh failed: User not found (404).")
+            else:
+                print(f"Session refresh failed: {resp.status_code} {resp.text}")
+    except httpx.RequestError as exc:
+        print(f"Network error during session refresh: {exc}")
+    except Exception as e:
+        print(f"Unexpected error during session refresh: {e}")
+    return False
+
+# --- API Test Logic ---
+
+async def make_api_call(access_code: str, endpoint: str, student_id: str) -> None:
+    """
+    Makes an API call to the specified endpoint using the access_code for authentication.
+    Handles 401/cookie expiration by attempting automatic refresh.
+    """
+    if not all([access_code, student_id]):
         print("Missing data for API call. Skipping.")
         return
 
-    print("\n" + "="*50)
-    print("Attempting API Call...")
-    print("="*50)
-
-    # Convert cookies list of dicts to header string
-    cookie_string = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
-
-    # Construct API URL based on the chosen endpoint
-    base_api_url = f"http://127.0.0.1:8000/profiles/{username}"
+    # Build endpoint URL and output file
     if endpoint == "week/0":
-        api_url = f"{base_api_url}/weeks/0?student_id={student_id}"
+        api_url = f"{API_BASE}/sync"
+        body = {"student_id": student_id, "offsets": [0]}
         output_filename = SCRIPT_DIR / "api_response_week_0.json"
     elif endpoint == "weeks/all":
-        api_url = f"{base_api_url}/weeks/all?student_id={student_id}"
+        api_url = f"{API_BASE}/sync"
+        body = {"student_id": student_id, "offsets": "all"}
         output_filename = SCRIPT_DIR / "api_response_all.json"
     elif endpoint == "weeks/current_forward":
-        api_url = f"{base_api_url}/weeks/current_forward?student_id={student_id}"
+        api_url = f"{API_BASE}/sync"
+        body = {"student_id": student_id, "offsets": "current_forward"}
         output_filename = SCRIPT_DIR / "api_response_current_forward.json"
     elif endpoint.startswith("weeks/forward/"):
         try:
@@ -166,7 +270,8 @@ async def make_api_call(username: str, cookies: list, student_id: str, endpoint:
             if count < 0:
                 print("Error: Count for forward weeks cannot be negative.")
                 return
-            api_url = f"{base_api_url}/weeks/forward/{count}?student_id={student_id}"
+            api_url = f"{API_BASE}/sync"
+            body = {"student_id": student_id, "offsets": list(range(count))}
             output_filename = SCRIPT_DIR / f"api_response_forward_{count}.json"
         except (ValueError, IndexError):
             print(f"Error: Invalid format for forward weeks endpoint: {endpoint}")
@@ -175,15 +280,14 @@ async def make_api_call(username: str, cookies: list, student_id: str, endpoint:
         print(f"Error: Unknown endpoint '{endpoint}'.")
         return
 
-    headers = {"Cookie": cookie_string}
+    headers = {"X-Access-Code": access_code}
     print(f"Target Endpoint: {endpoint}")
     print(f"Output File: {output_filename}")
 
     try:
         async with httpx.AsyncClient() as client:
-            print(f"Sending GET request to: {api_url}")
-            response = await client.get(api_url, headers=headers, timeout=30.0)
-
+            print(f"Sending POST request to: {api_url}")
+            response = await client.post(api_url, headers=headers, json=body, timeout=30.0)
             print(f"API Response Status Code: {response.status_code}")
 
             if response.status_code == 200:
@@ -191,18 +295,40 @@ async def make_api_call(username: str, cookies: list, student_id: str, endpoint:
                     response_data = response.json()
                     print("\nAPI Response (JSON):")
                     print(json.dumps(response_data, indent=2))
-                    # --- Save API Response ---
                     try:
                         async with aiofiles.open(output_filename, "w", encoding='utf-8') as f:
-                            # Add ensure_ascii=False to prevent escaping non-ASCII characters
                             await f.write(json.dumps(response_data, indent=2, ensure_ascii=False))
                         print(f"\nAPI response saved to {output_filename}")
                     except Exception as e:
                         print(f"\nError saving API response to {output_filename}: {e}")
-                    # --- End Save API Response ---
                 except json.JSONDecodeError:
                     print("\nError: Could not decode JSON response from API.")
                     print("Response Text:", response.text)
+            elif response.status_code == 401:
+                # Check for expired cookies error code
+                try:
+                    data = response.json()
+                    if data.get("error_code") == "COOKIES_EXPIRED":
+                        print("Session expired. Attempting automatic refresh...")
+                        student_id, _, _ = await load_data()
+                        if not student_id:
+                            print("No student_id found for refresh.")
+                            return
+                        success = await perform_session_refresh(student_id)
+                        if success:
+                            print("Refresh successful. Retrying API call...")
+                            _, _, new_access_code = await load_data()
+                            if new_access_code:
+                                await make_api_call(new_access_code, endpoint, student_id)
+                            else:
+                                print("Could not load new access code after refresh.")
+                        else:
+                            print("Automatic refresh failed. Please run with --refresh manually.")
+                        return
+                except Exception:
+                    pass
+                print("\nAPI request failed with 401 Unauthorized.")
+                print("Response Text:", response.text)
             else:
                 print("\nAPI request failed.")
                 print("Response Text:", response.text)
@@ -213,66 +339,78 @@ async def make_api_call(username: str, cookies: list, student_id: str, endpoint:
         print(f"\nError response {exc.response.status_code} while requesting {exc.request.url!r}.")
         print("Response Text:", exc.response.text)
     except Exception as e:
-         print(f"\nAn unexpected error occurred during API call: {e}")
+        print(f"\nAn unexpected error occurred during API call: {e}")
 
+# --- Main CLI ---
 
 async def main():
-    """Main function to get auth data and make API call."""
-
-    # --- Argument Parsing ---
+    """Main function to manage Glasir authentication and API testing."""
     parser = argparse.ArgumentParser(
-        description="Get Glasir authentication data (cookies, student ID) and optionally test API."
+        description="Glasir Auth Tool: Manage authentication and test Glasir API endpoints."
     )
     parser.add_argument(
-        "--force-login",
+        "--force-initial-sync",
         action="store_true",
-        help="Force a new login via Playwright, ignoring any saved data.",
+        help="Force a new login and initial sync, ignoring any saved data."
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Refresh the session (get new cookies and access code)."
     )
     parser.add_argument(
         "--test-all",
         action="store_true",
-        help="Test all endpoints (week/0, weeks/all, weeks/current_forward) sequentially.",
+        help="Test all endpoints (week/0, weeks/all, weeks/current_forward) sequentially."
     )
     args = parser.parse_args()
 
+    # Dependency check
     try:
         import aiofiles
     except ImportError:
         print("Error: 'aiofiles' package is required. Please install it (`pip install aiofiles`)")
         return
 
-    username = None
-    cookies = None # Initialize to None
-    student_id = None
+    # --- Session Refresh Flow ---
+    if args.refresh:
+        student_id, _, _ = await load_data()
+        if not student_id:
+            print("No student_id found. Cannot refresh session.")
+            return
+        success = await perform_session_refresh(student_id)
+        print("Session refresh completed." if success else "Session refresh failed.")
+        return
 
-    if args.force_login:
-        print("--force-login specified. Skipping saved data check and initiating Playwright login...")
-        username, cookies, student_id = await perform_playwright_login()
+    # --- Initial Sync Flow ---
+    student_id = None
+    cookies = None
+    access_code = None
+
+    if args.force_initial_sync:
+        print("--force-initial-sync specified. Skipping saved data and initiating Playwright login + initial sync...")
+        student_id, cookies, access_code = await perform_playwright_login_and_initial_sync()
     else:
         print("Checking for existing authentication data...")
-        username, cookies, student_id = await load_data()
-
-        if all([username, cookies, student_id]):
+        student_id, cookies, access_code = await load_data()
+        if all([student_id, cookies, access_code]):
             print("Existing data found:")
-            print(f"  Username: {username}")
-            # Check if cookies is a list before getting len
-            print(f"  Cookies: Loaded ({len(cookies) if isinstance(cookies, list) else 'Invalid Format'})")
             print(f"  Student ID: {student_id}")
+            print(f"  Cookies: Loaded ({len(cookies) if isinstance(cookies, list) else 'Invalid Format'})")
+            print(f"  Access Code: {access_code[:8]}... (truncated)")
             print("Using existing data.")
         else:
-            print("Existing data incomplete or not found. Starting Playwright login...")
-            username, cookies, student_id = await perform_playwright_login()
+            print("Existing data incomplete or not found. Starting Playwright login + initial sync...")
+            student_id, cookies, access_code = await perform_playwright_login_and_initial_sync()
 
-    # Check if login (forced or fallback) was successful
-    if not all([username, cookies, student_id]):
-            print("Failed to obtain authentication data via Playwright. Exiting.")
-            return # Exit if Playwright failed
+    if not all([student_id, cookies, access_code]):
+        print("Failed to obtain authentication data via Playwright and initial sync. Exiting.")
+        return
 
     # --- Endpoint Selection or Testing ---
     endpoints_to_call = []
     if args.test_all:
         print("\n--test-all specified. Testing all endpoints (will prompt for count)...")
-        # Prompt for count even in test-all mode for the forward endpoint
         while True:
             try:
                 count_input = input("Enter the 'count' for the forward weeks endpoint test (e.g., 3): ").strip()
@@ -284,11 +422,10 @@ async def main():
             except ValueError:
                 print("Invalid input. Please enter an integer.")
             except (EOFError, KeyboardInterrupt):
-                 print("\nOperation cancelled by user.")
-                 return
+                print("\nOperation cancelled by user.")
+                return
         endpoints_to_call = ["week/0", "weeks/all", "weeks/current_forward", f"weeks/forward/{count}"]
     else:
-        # Interactive Selection
         print("\nSelect the API endpoint to call:")
         print("  1: week/0 (Default single week)")
         print("  2: weeks/all (All available weeks)")
@@ -320,14 +457,14 @@ async def main():
                             print("Invalid input. Please enter an integer.")
                         except (EOFError, KeyboardInterrupt):
                             print("\nOperation cancelled by user.")
-                            return # Exit if count input is cancelled
-                    break # Exit outer loop once count is obtained
+                            return
+                    break
                 else:
                     print("Invalid choice. Please enter 1, 2, 3, or 4.")
-            except EOFError: # Handle Ctrl+D or similar
+            except EOFError:
                 print("\nOperation cancelled by user.")
                 return
-            except KeyboardInterrupt: # Handle Ctrl+C
+            except KeyboardInterrupt:
                 print("\nOperation cancelled by user.")
                 return
 
@@ -337,17 +474,12 @@ async def main():
     else:
         for endpoint in endpoints_to_call:
             print(f"\n--- Calling Endpoint: {endpoint} ---")
-            await make_api_call(username, cookies, student_id, endpoint)
+            await make_api_call(access_code, endpoint, student_id)
             if args.test_all and endpoint != endpoints_to_call[-1]:
                 print("\nWaiting a moment before next test...")
-                await asyncio.sleep(2) # Brief pause between tests
+                await asyncio.sleep(2)
 
     print("\nScript finished.")
 
-
 if __name__ == "__main__":
-    # Add the directory containing this script to sys.path if needed,
-    # although it's generally better to run scripts as modules if imports become complex.
-    # import sys
-    # sys.path.append(str(SCRIPT_DIR))
     asyncio.run(main())

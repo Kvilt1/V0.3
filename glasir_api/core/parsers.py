@@ -1,20 +1,44 @@
+
 # glasir_api/core/parsers.py
 import logging
 import re
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass, field # Add dataclass import
+from typing import Any, Dict, List, Optional, Tuple # Moved import here
+
+# --- Dataclasses ---
+
+@dataclass
+class ParseResult:
+    """Holds the result of parsing HTML content."""
+    status: str # e.g., 'Success', 'ParseFailed', 'StructureError'
+    data: Optional[Dict[str, Any]] = None # Parsed data (e.g., events, week_info)
+    warnings: List[str] = field(default_factory=list)
+    error_message: Optional[str] = None
 
 from bs4 import BeautifulSoup, Tag
 
 # Use relative imports for components within the 'glasir_api.core' package
 from .constants import CANCELLED_CLASS_INDICATORS, DAY_NAME_MAPPING
 from .date_utils import to_iso_date, parse_time_range # Added parse_time_range
-from .formatting import format_academic_year # Removed parse_time_range
+from .formatting import format_academic_year
+from ..models.models import Event # Import the Event model using relative path
 
 # Basic logging setup
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(name)s - %(message)s')
 log = logging.getLogger(__name__)
 
+class GlasirParserError(Exception):
+    """Base exception for parser-related errors."""
+    def __init__(self, message: str, html_content: Optional[str] = None):
+        super().__init__(message)
+        # Optionally store the problematic HTML for debugging
+        self.html_content = html_content
+
+    def __str__(self) -> str:
+        # Optionally add more context to the error message if needed
+        return super().__str__()
 # --- Homework Parser ---
 _RE_SPACE_BEFORE_NEWLINE = re.compile(r" +\n")
 _RE_SPACE_AFTER_NEWLINE = re.compile(r"\n +")
@@ -234,15 +258,20 @@ def parse_teacher_html(html: str) -> Dict[str, str]:
     return teacher_map
 
 
+# --- Result Structures ---
+# Removed ParseResult dataclass as it's no longer used by parse_week_html
+
+
 # --- Timetable Parser ---
 # Regex for student info (Name, Class) - made slightly more robust
 # Regex updated to capture name potentially containing commas, stopping before the last comma,
 # and capturing the class after the last comma.
 # Regex refined: Capture name (non-greedy) and class after the colon and comma. Applied to the text content *after* finding the correct TD.
 # Regex refined: Capture name (non-greedy) and class (alphanumeric) directly after the prefix. Applied to the full text content of the TD.
+# Regex refined: Capture name (non-greedy) and class (allowing spaces) after the prefix. Applied to the full text content of the TD.
 _RE_STUDENT_INFO = re.compile(
-    r"N[æ&aelig;]mingatímatalva\s*:\s*([^<]+?)\s*,\s*(\w+)"
-) # Example: "Næmingatímatalva: Rókur Kvilt Meitilberg, 22y <..." -> ('Rókur Kvilt Meitilberg', '22y')
+    r"N[æ&aelig;]mingatímatalva\s*:\s*(.*?)\s*,\s*([\w\s]+)\b"
+) # Example: "Næmingatímatalva : Rókur Kvilt Meitilberg , 22y" -> ('Rókur Kvilt Meitilberg', '22y')
 _RE_DATE_RANGE = re.compile(
     r"(\d{1,2}\.\d{1,2}\.\d{4})\s*-\s*(\d{1,2}\.\d{1,2}\.\d{4})"
 )
@@ -278,492 +307,378 @@ def get_timeslot_info(start_col_index: int) -> Dict[str, str]:
         log.warning(f"Unknown timeslot for start column index: {start_col_index}")
         return {"slot": "N/A", "time": "N/A"}
 
-def parse_timetable_html(
-    html: str, teacher_map: Optional[Dict[str, str]] = None
-) -> Tuple[Dict[str, Any], List[str]]:
+def parse_week_html(
+    html_content: Optional[str], teacher_map: Optional[Dict[str, str]] = None
+) -> List[Event]: # Return List[Event] directly
     """
-    Parses the main timetable HTML page to extract week information, student info,
-    and individual lesson events.
+    Parses the main timetable HTML page to extract individual lesson events.
 
     Args:
-        html: The HTML content string of the timetable page.
+        html_content: The HTML content string of the timetable page, or None.
         teacher_map: An optional dictionary mapping teacher initials to full names.
 
     Returns:
-        A tuple containing:
-        - timetable_data: A dictionary containing 'studentInfo', 'weekInfo', and 'events'.
-        - homework_ids: A list of lesson IDs (str) that have a homework note icon.
+        A list of Event objects parsed from the HTML. Returns an empty list if
+        no events are found or if the HTML indicates no events for the week.
+
+    Raises:
+        GlasirParserError: If the input HTML is empty/None, if the main timetable
+                           structure is missing or invalid, or if a critical error
+                           occurs during parsing (e.g., failure to parse essential event data).
     """
-    timetable_data: Dict[str, Any] = {"studentInfo": {}, "weekInfo": {}, "events": []}
-    homework_ids: List[str] = []
+    if not html_content or not html_content.strip(): # Check for None or effectively empty string
+        log.warning("parse_week_html received None or empty HTML content.")
+        # // TDD Anchor: Test parse failure with empty/None input
+        raise GlasirParserError("Input HTML content is empty or invalid", html_content=html_content)
+
     teacher_map = teacher_map or {} # Ensure teacher_map is a dict
+    warnings: List[str] = [] # Initialize warnings list (still useful for logging)
+    # Removed student_info_dict and week_info_dict as they are not returned
+    events_list: List[Event] = []
+    homework_ids_list: List[str] = [] # Keep for internal logic if needed
+    # Store parsed week/student info locally for inclusion in result data
+    parsed_student_info = {}
+    parsed_week_info = {} # Initialize parsed_week_info
 
     try:
-        # Log the *entire* HTML received by the parser for detailed comparison
-        log.debug(f"Parser received FULL HTML:\n{html}\n--- END OF FULL HTML ---")
-        # Revert back to lxml parser
         log.debug("Attempting to parse HTML using 'lxml'")
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html_content, "lxml")
 
-        # --- Extract Student Info (Robust Method: Find TD, then parse text) ---
+        # --- Extract Student Info (Keep for logging/context if needed, but not returned) ---
         student_info_td = soup.find(lambda tag: tag.name == 'td' and 'Næmingatímatalva' in tag.get_text())
         student_name = None
         student_class = None
         if student_info_td:
-            # Extract only the initial text node content before the nested table
-            initial_text = ""
-            for content in student_info_td.contents:
-                if isinstance(content, str):
-                    initial_text += content
-                elif isinstance(content, Tag) and content.name == 'table':
-                    break # Stop when the nested table is encountered
-                # Ignore other tags like <br> if any before the table
-            initial_text = initial_text.strip() # Clean whitespace
-
-            log.debug(f"Extracted initial text from student info TD: '{initial_text}'")
-
-            # Apply the regex to the cleaner initial text
-            student_info_match = _RE_STUDENT_INFO.search(initial_text)
+            # Extract text more robustly, handling nested tags
+            full_text = student_info_td.get_text(separator=' ', strip=True)
+            # Attempt to match the refined regex on the full text
+            student_info_match = _RE_STUDENT_INFO.search(full_text)
             if student_info_match:
                 student_name = student_info_match.group(1).strip()
-                student_class = student_info_match.group(2).strip()
-                log.debug(f"Parsed student info from initial text (regex): Name='{student_name}', Class='{student_class}'")
+                # The class might have extra text after it (like '<'), remove potential trailing non-alphanumeric/space chars
+                student_class_raw = student_info_match.group(2).strip()
+                # Clean up class - remove anything after the expected pattern (e.g., '22y < table ...')
+                class_match = re.match(r"([\w\s]+)", student_class_raw)
+                student_class = class_match.group(1).strip() if class_match else student_class_raw
+
+                parsed_student_info = {"studentName": student_name, "class": student_class} # Store parsed info using correct keys
+                log.debug(f"Parsed student info (regex on full text): Name='{student_name}', Class='{student_class}'")
             else:
-                # Fallback if regex fails even on initial text (less likely now)
-                log.warning(f"Regex failed on student info initial text: '{initial_text}'. Trying split fallback.")
-                parts = initial_text.split(':')
-                if len(parts) > 1:
-                    name_class_part = parts[1].strip()
-                    name_class_split = name_class_part.split(',')
-                    if len(name_class_split) > 1:
-                        student_name = name_class_split[0].strip()
-                        student_class = name_class_split[1].strip()
-                        log.debug(f"Parsed student info from initial text (split fallback): Name='{student_name}', Class='{student_class}'")
-                    else:
-                         log.warning(f"Could not split name/class part after colon using comma: '{name_class_part}'")
-                else:
-                    log.warning(f"Could not find colon ':' in student info initial text.")
+                 warnings.append(f"Regex failed to parse student info from TD text: '{full_text}'")
+                 log.warning(f"Student info regex failed on text: '{full_text}'") # Log the text that failed
         else:
+            warnings.append("Could not find TD containing 'Næmingatímatalva'.")
             log.warning("Could not find TD containing 'Næmingatímatalva'.")
 
-        # Assign to timetable_data if found, otherwise leave empty for validation
-        if student_name and student_class:
-             timetable_data["studentInfo"] = {
-                 "studentName": student_name,
-                 "class": student_class,
-             }
-        else:
-             log.error("Failed to parse student name and class after attempting multiple methods.")
-             # Keep studentInfo empty
+        # Check if parsing succeeded and log warning if not
+        if not student_name or not student_class:
+             # Combine warnings if both methods failed
+             if not student_info_td: # If TD wasn't found initially
+                 pass # Warning already added
+             elif not student_info_match: # If TD was found but regex failed
+                 pass # Warning already added
+             else: # Should not happen if regex matched, but defensively add warning
+                 warnings.append("Failed to parse student name and/or class after finding TD.")
+             log.warning("Failed to parse student name/class.") # Keep general warning
 
-        # --- Extract Week Info (from full soup object and HTML string) ---
-        week_info = timetable_data["weekInfo"] # Shorthand
-        # Week number from the selected week button (search full soup)
-        week_link = soup.select_one("a.UgeKnapValgt") # Search full soup
+        # --- Extract Week Info ---
+        # Prioritize parsing dates first to determine the correct ISO year and week
+        iso_start_date = None
+        iso_end_date = None
+        iso_year = None
+        iso_week_number = None
+
+        date_range_match = _RE_DATE_RANGE.search(html_content)
+        if date_range_match:
+            start_date_str = date_range_match.group(1)
+            end_date_str = date_range_match.group(2)
+            iso_start_date = to_iso_date(start_date_str)
+            iso_end_date = to_iso_date(end_date_str)
+
+            if iso_start_date:
+                parsed_week_info['startDate'] = iso_start_date
+                try:
+                    # Use isocalendar() to get the correct ISO year and week number
+                    start_dt = datetime.strptime(iso_start_date, "%Y-%m-%d")
+                    iso_calendar = start_dt.isocalendar()
+                    iso_year = iso_calendar.year
+                    iso_week_number = iso_calendar.week
+                    parsed_week_info['year'] = iso_year
+                    parsed_week_info['weekNumber'] = iso_week_number
+                    log.debug(f"Derived ISO year={iso_year}, week={iso_week_number} from start date {iso_start_date}")
+                except ValueError as e:
+                    warnings.append(f"Could not parse ISO start date '{iso_start_date}' for isocalendar: {e}")
+            else:
+                warnings.append(f"Could not parse start date '{start_date_str}' to ISO format.")
+
+            if iso_end_date:
+                 parsed_week_info['endDate'] = iso_end_date
+            else:
+                 warnings.append(f"Could not parse end date '{end_date_str}' to ISO format.")
+        else:
+            warnings.append("Could not parse date range (DD.MM.YYYY - DD.MM.YYYY) from HTML.")
+            # If date range fails, we cannot reliably determine week/year
+            log.error("Critical failure: Could not parse date range to determine week/year.")
+            # Consider returning ParseFailed here if date range is essential
+            # return ParseResult(status='ParseFailed', error_message="Could not parse date range", warnings=warnings)
+
+
+        # Attempt to parse week number from link text as a fallback/validation check (optional)
+        week_link = soup.select_one("a.UgeKnapValgt")
+        week_number_from_link = None
         if week_link:
             week_text = week_link.get_text(strip=True)
             if week_text.startswith("Vika "):
                 try:
-                    week_info["weekNumber"] = int(week_text.replace("Vika ", ""))
+                    week_number_from_link = int(week_text.replace("Vika ", ""))
+                    # Optionally validate against iso_week_number if both were found
+                    if iso_week_number is not None and week_number_from_link != iso_week_number:
+                        warning_msg = f"Week number mismatch: Link text '{week_text}' ({week_number_from_link}) vs isocalendar ({iso_week_number}). Using isocalendar result."
+                        warnings.append(warning_msg)
+                        log.warning(warning_msg)
+                    # If isocalendar failed but link parsing worked, maybe use it as fallback?
+                    # elif iso_week_number is None:
+                    #     parsed_week_info['weekNumber'] = week_number_from_link
+                    #     warnings.append(f"Using week number {week_number_from_link} from link text as fallback.")
+
                 except ValueError:
-                    log.warning(f"Could not parse week number from text: '{week_text}'")
+                    warnings.append(f"Could not parse week number from link text: '{week_text}'")
             else:
-                log.warning(f"Selected week link text format unexpected: '{week_text}'")
+                warnings.append(f"Selected week link text format unexpected: '{week_text}'")
         else:
-            log.warning("Could not find selected week link (a.UgeKnapValgt) in HTML.")
+            warnings.append("Could not find selected week link (a.UgeKnapValgt) in HTML.")
 
-        # Date range and year (search full HTML string)
-        date_range_match = _RE_DATE_RANGE.search(html) # Search full HTML
-        current_year = None
-        if date_range_match:
-            start_date_str = date_range_match.group(1) # DD.MM.YYYY
-            end_date_str = date_range_match.group(2)   # DD.MM.YYYY
-            week_info["startDate"] = to_iso_date(start_date_str)
-            week_info["endDate"] = to_iso_date(end_date_str)
-            if week_info.get("startDate"):
-                try:
-                    # Extract year from the successfully parsed start date
-                    current_year = int(week_info["startDate"].split("-")[0])
-                    week_info["year"] = current_year
-                except (ValueError, IndexError, TypeError):
-                    log.warning(f"Could not parse year from ISO startDate: {week_info.get('startDate')}")
-            else:
-                 log.warning(f"Could not parse start date '{start_date_str}' to ISO format.")
-        else:
-            log.warning("Could not parse date range (DD.MM.YYYY - DD.MM.YYYY) from HTML.")
+        # Ensure essential week info was parsed before proceeding
+        if 'year' not in parsed_week_info or 'weekNumber' not in parsed_week_info:
+             log.error("Failed to determine essential week info (year/weekNumber). Cannot proceed reliably.")
+             # Return ParseFailed if year/weekNumber are critical
+             return ParseResult(status='ParseFailed', error_message="Failed to determine year/weekNumber", warnings=warnings)
 
-        # Fallback: try to get year from current system time if not found or parsed
-        if not current_year:
-             current_year = datetime.now().year
-             week_info["year"] = current_year # Set year in weekInfo even if dates failed
-             log.warning(f"Falling back to current system year: {current_year}")
 
-        log.debug(f"Parsed week info: {week_info}")
+        log.debug(f"Final Parsed week info (for context): {parsed_week_info}")
 
-        # --- Extract Events from Table (search directly) ---
-        table = soup.select_one("table.time_8_16") # Select table directly
+        # --- Extract Events from Table ---
+        table = soup.select_one("table.time_8_16")
         if not table:
-             log.error("Timetable table (table.time_8_16) not found in HTML.")
-             return timetable_data, homework_ids
+             log.warning("Timetable table (table.time_8_16) not found in HTML.")
+             possible_no_events_tags = soup.select('p, div.alert, td.header')
+             no_events_found_text = None
+             for tag in possible_no_events_tags:
+                 text = tag.get_text(strip=True).lower()
+                 if "ongi skeið" in text or "frídagur" in text or "eingin undirvísing" in text:
+                     no_events_found_text = tag.get_text(strip=True)
+                     log.info(f"Found explicit 'no events' message: '{no_events_found_text}'")
+                     break
+
+             if no_events_found_text:
+                 log.info("Returning successful ParseResult (no events) due to explicit message.")
+                 return ParseResult(status='Success', data={'events': [], 'week_info': parsed_week_info, 'student_info': parsed_student_info}, warnings=warnings)
+             else:
+                 error_msg = "Could not find main schedule container (table.time_8_16) and no explicit 'no events' message detected."
+                 log.error(error_msg)
+                 # Return ParseResult indicating failure
+                 return ParseResult(status='ParseFailed', error_message=error_msg, warnings=warnings)
 
         log.debug(f"Successfully located timetable table using 'table.time_8_16'.")
 
         rows = table.select("tr")
         current_day_name_fo: Optional[str] = None
-        current_date_part: Optional[str] = None # DD/MM part
+        current_date_part: Optional[str] = None
 
         for row_index, row in enumerate(rows):
             cells = row.select("td")
-            if not cells:
-                continue
+            if not cells: continue
 
             first_cell = cells[0]
             first_cell_text = first_cell.get_text(separator=" ", strip=True)
-
-            # Check if this row is a day header row
             day_match = _RE_DAY_DATE.match(first_cell_text)
-            is_day_header = "lektionslinje_1" in first_cell.get(
-                "class", []
-            ) or "lektionslinje_1_aktuel" in first_cell.get("class", [])
+            is_day_header = "lektionslinje_1" in first_cell.get("class", []) or "lektionslinje_1_aktuel" in first_cell.get("class", [])
 
             if is_day_header:
-                log.debug(f"Row {row_index}: Identified as day header. Text: '{first_cell_text}'")
-                # This row is identified as a day header row.
-                if day_match:
-                    # Successfully parsed day name and date part
+                # Only attempt regex match if the text is not empty
+                if first_cell_text and day_match:
                     current_day_name_fo = day_match.group(1)
-                    current_date_part = day_match.group(2) # Store DD/MM
-                    log.debug(f"Row {row_index}: Successfully parsed day header: Day='{current_day_name_fo}', Date='{current_date_part}'")
+                    current_date_part = day_match.group(2)
+                    log.debug(f"Row {row_index}: Set day context: Day='{current_day_name_fo}', Date='{current_date_part}'")
                 else:
-                    # Header row without a parsable date match (e.g., empty day, weekend)
-                    # This case might apply to rows that are *just* spacers between days, like the <td class=mellem_1> rows.
-                    # We still want to reset context if the regex fails on a row marked as a header.
-                    log.warning(f"Row {row_index}: Identified as day header (class check), but regex failed to parse date: '{first_cell_text}'. Resetting day context.")
-                    current_day_name_fo = None # Reset day context
+                    # Log warning if it's a header but regex failed (or text was empty)
+                    warning_msg = f"Row {row_index}: Day header identified, but regex failed or text empty: '{first_cell_text}'. Resetting day context."
+                    log.warning(warning_msg)
+                    warnings.append(warning_msg)
+                    current_day_name_fo = None
                     current_date_part = None
-                # --- REMOVED 'continue' ---
-                # Now we proceed to check cells in this row even if it's a header row,
-                # because lesson data might be in subsequent cells of the same row.
-            elif not day_match: # Explicitly check if it wasn't a day header based on regex match
-                # This handles rows that are clearly not day headers (e.g., the pure 'mellem' spacer rows)
-                log.debug(f"Row {row_index}: Not identified as day header based on text/regex. First cell text: '{first_cell_text}', Classes: {first_cell.get('class', [])}. Skipping row processing.")
-                # If it's not a day header row at all, we can safely skip processing its cells.
-                continue
+            # Removed the 'elif not day_match' as the logic is handled within 'if is_day_header'
 
-            # --- Process Lesson Cells (Only if not a header row) ---
-            # Ensure we have valid day context before processing lesson cells
+            # This check remains to ensure context is valid before processing cells
             if not current_day_name_fo or not current_date_part:
-                 # Skip processing cells if we haven't encountered a valid day header yet
-                 # or if the last header was malformed.
-                 log.debug(f"Skipping row {row_index} cell processing as current day/date context is not validly set.")
+                 log.debug(f"Skipping row {row_index} cell processing - invalid day context.")
                  continue
 
-            # Log row info *before* cell loop
             log.debug(f"Processing row index {row_index} for day: {current_day_name_fo}")
-            current_col_index = 1 # Reset column index for each row
-            lessons_found_in_row = 0 # Counter for lessons in this row
-            day_en = DAY_NAME_MAPPING.get(current_day_name_fo, current_day_name_fo) # Translate day name
+            current_col_index = 1
+            day_en = DAY_NAME_MAPPING.get(current_day_name_fo, current_day_name_fo)
 
             for cell_index, cell in enumerate(cells):
-                 # Skip the first cell in any row processed by this inner loop,
-                 # as it's either the day header or empty spacing before lessons.
-                 # Skip the first cell (index 0) in *any* row being processed by this inner loop.
-                 # This cell contains either the day/date info (in header rows) or is an empty spacer.
                  if cell_index == 0:
-                      log.debug(f"  Skipping cell 0 (contains day info or is a spacer)")
-                      # Need to account for its colspan if skipping, to keep current_col_index accurate
-                      try:
-                            # Use the actual first cell (cells[0]) to get colspan, not the loop variable 'cell'
-                            colspan = int(cells[0].get("colspan", 1))
-                      except ValueError:
-                            colspan = 1
+                      try: colspan = int(cells[0].get("colspan", 1))
+                      except ValueError: colspan = 1
                       current_col_index += colspan
                       continue
 
-                 log.debug(f"  Processing cell {cell_index} (Col ~{current_col_index}) - Classes: {cell.get('class', 'N/A')}") # ADDED DETAILED LOG
-                 colspan = 1
-                 # --- Start of indented block ---
-                 try:
-                     colspan_str = cell.get("colspan")
-                     if colspan_str:
-                         colspan = int(colspan_str)
+                 try: colspan = int(cell.get("colspan", 1))
                  except (ValueError, TypeError):
-                     log.warning(f"Could not parse colspan for cell: {cell.get('colspan', 'None')}")
-                     colspan = 1 # Default to 1 if parsing fails
+                     warnings.append(f"Row {row_index}, Cell {cell_index}: Could not parse colspan '{cell.get('colspan')}'")
+                     colspan = 1
 
-                 # Revert to standard class check but add detailed logging
-                 classes = cell.get("class", []) # Get class list
-                 class_str = ' '.join(classes) if isinstance(classes, list) else str(classes) # For logging
-
-                 # --- Lesson Identification (Reverted & Refined) ---
-                 # Check for class names starting with 'lektionslinje_lesson' followed by a digit,
-                 # as observed in the actual HTML (e.g., 'lektionslinje_lesson0').
-                 # Also check for cells with 'mellem' class that contain lesson information.
+                 classes = cell.get("class", [])
                  is_lesson = False
                  lesson_class_pattern = re.compile(r"lektionslinje_lesson\d+")
                  if isinstance(classes, list):
                      for cls in classes:
-                          if lesson_class_pattern.match(cls):
-                              is_lesson = True
-                              break # Found a match
-                 elif isinstance(classes, str): # Fallback if class is a single string
-                     if lesson_class_pattern.match(classes):
-                         is_lesson = True
-                 
-                 # Removed the check for 'mellem' class as potential lessons,
-                 # as the HTML analysis shows 'mellem' cells are just spacers.
-                 # Lesson identification now relies solely on the 'lektionslinje_lesson\d+' class pattern.
+                          if lesson_class_pattern.match(cls): is_lesson = True; break
+                 elif isinstance(classes, str):
+                     if lesson_class_pattern.match(classes): is_lesson = True
 
                  is_cancelled = any(cls in CANCELLED_CLASS_INDICATORS for cls in classes if isinstance(cls, str))
 
-                 log.debug(f"    Cell {cell_index} check result: is_lesson={is_lesson} (based on class pattern), is_cancelled={is_cancelled}, Classes='{class_str}'")
-
                  if is_lesson:
-                     lessons_found_in_row += 1 # Increment counter
-                     a_tags = cell.select("a") # Select links directly from the lesson cell
-                     # Expecting at least 3 <a> tags for subject, teacher, room in a valid lesson cell
+                     a_tags = cell.select("a")
                      if len(a_tags) >= 3:
-                         log.debug(f"      Cell {cell_index}: Identified as lesson AND found {len(a_tags)} links. Proceeding to parse.")
                          class_code_raw = a_tags[0].get_text(strip=True)
                          teacher_short = a_tags[1].get_text(strip=True)
                          room_raw = a_tags[2].get_text(strip=True)
 
-                         # --- Code below is now correctly indented within the if len(a_tags) >= 3 block ---
-
                          # --- Parse Subject Code ---
+                         # Regex to extract subject and level from the first part (e.g., "BV3" -> "BV", "3" or "MATB" -> "MAT", "B")
+                         _RE_SUBJECT_LEVEL = re.compile(r"^([a-zA-Z]+)(\d*|[A-Z]?)$")
                          code_parts = class_code_raw.split("-")
-                         subject_code = ""
+                         subject_code = class_code_raw # Default
                          level = ""
-                         year_code = "" # Academic year part like '2425'
+                         year_code = ""
                          if code_parts:
                              # Handle specific "Várroynd" format
                              if code_parts[0] == "Várroynd" and len(code_parts) > 4:
                                  subject_code = f"{code_parts[0]}-{code_parts[1]}"
                                  level = code_parts[2]
-                                 # Assuming team/group is part 3, year is part 4
                                  year_code = code_parts[4]
                              # Handle standard format like SUBJ-LVL-TEAM-YEAR
                              elif len(code_parts) > 3:
                                  subject_code = code_parts[0]
                                  level = code_parts[1]
-                                 # Assuming team is part 2, year is part 3
                                  year_code = code_parts[3]
-                             else: # Fallback if format is unexpected
-                                 subject_code = class_code_raw # Use the raw string
-                                 log.warning(f"Unexpected subject code format: {class_code_raw}")
+                             # Handle format like SUBJLEVEL-YEARCODE-CLASSLIKE (e.g., BV3-2425-22y)
+                             elif len(code_parts) == 3:
+                                 subject_level_match = _RE_SUBJECT_LEVEL.match(code_parts[0])
+                                 if subject_level_match:
+                                     subject_code = subject_level_match.group(1)
+                                     level = subject_level_match.group(2) or "" # Assign level or empty string
+                                 else:
+                                     subject_code = code_parts[0] # Fallback if regex fails
+                                     level = ""
+                                 year_code = code_parts[1] # Year code is the second part
+                                 # The third part (class-like) is ignored
+                                 log.debug(f"Parsed subject format '{class_code_raw}' as SUBJLEVEL-YEARCODE-CLASSLIKE")
+                             # Fallback if format is unexpected
+                             else:
+                                 warnings.append(f"Row {row_index}, Cell {cell_index}: Unexpected subject code format: {class_code_raw}")
+                                 log.warning(f"Unexpected subject code format encountered: {class_code_raw}")
 
+                         teacher_full = teacher_map.get(teacher_short, teacher_short)
+                         location = room_raw.replace("st.", "").strip()
 
-                         # --- Teacher and Location ---
-                         teacher_full = teacher_map.get(teacher_short, teacher_short) # Use map or default to short
-                         location = room_raw.replace("st.", "").strip() # Clean room string
-
-                         # --- Time and Date ---
-                         # Determine time slot based on column index
-                         if colspan >= 90: # Heuristics for all-day events based on colspan
-                             time_info = {"slot": "All day", "time": "08:10-15:25"} # Approximate
-                         else:
-                             time_info = get_timeslot_info(current_col_index)
-                         # log.debug(f"      Calculated time_info: {time_info}") # Compacted log
+                         if colspan >= 90: time_info = {"slot": "All day", "time": "08:10-15:25"}
+                         else: time_info = get_timeslot_info(current_col_index)
 
                          iso_date = None
-                         if current_date_part and current_year:
-                             # Combine DD/MM with the year determined earlier
-                             iso_date = to_iso_date(current_date_part, current_year)
-                         elif current_date_part:
-                             log.warning(
-                                 f"Cannot determine ISO date for '{current_date_part}' - year is missing or failed parsing."
-                             )
+                         # Use the iso_year derived earlier from isocalendar()
+                         if current_date_part and iso_year:
+                             iso_date = to_iso_date(current_date_part, iso_year)
+                         elif current_date_part: warnings.append(f"Row {row_index}, Cell {cell_index}: Cannot determine ISO date for '{current_date_part}' - year missing.")
 
                          start_time, end_time = parse_time_range(time_info["time"])
 
-                         # --- Lesson ID ---
                          lesson_id = None
-                         # Look for the span containing the lesson ID
                          lesson_span = cell.select_one('span[id^="MyWindow"][id$="Main"]')
                          if lesson_span and lesson_span.get("id"):
                              span_id = lesson_span["id"]
-                             # Extract ID: remove prefix "MyWindow" and suffix "Main"
-                             if len(span_id) > 12: # "MyWindow" (8) + "Main" (4) = 12
-                                 lesson_id = span_id[8:-4]
-                             else:
-                                 log.warning(
-                                     f"Found lesson span with unexpected ID format: {span_id}"
-                                 )
-                         else:
-                             # Log if the span is missing, might indicate HTML structure change
-                             log.warning(
-                                 f"Could not find lesson ID span in cell for {subject_code} on {iso_date}"
-                             )
-                         # log.debug(f"      Extracted lesson_id: {lesson_id}") # Compacted log
+                             if len(span_id) > 12: lesson_id = span_id[8:-4]
+                             else: warnings.append(f"Row {row_index}, Cell {cell_index}: Found lesson span with unexpected ID format: {span_id}")
+                         else: warnings.append(f"Row {row_index}, Cell {cell_index}: Could not find lesson ID span for {subject_code} on {iso_date}")
 
-                         # --- Homework Note Check ---
                          has_homework_note = False
-                         # Check for the note image icon using attribute selector
-                         note_img = cell.select_one(
-                             'input[type="image"][src*="note.gif"]'
-                         )
+                         note_img = cell.select_one('input[type="image"][src*="note.gif"]')
                          if note_img:
                              has_homework_note = True
-                             if lesson_id:
-                                 # Only add ID if homework note is present AND ID was found
-                                 homework_ids.append(lesson_id)
-                                 log.debug(f"Homework note found for lesson ID: {lesson_id}")
-                             else:
-                                 log.warning(f"Homework note found, but no lessonId extracted for cell: {subject_code} on {iso_date}")
+                             if lesson_id: homework_ids_list.append(lesson_id)
+                             else: warnings.append(f"Row {row_index}, Cell {cell_index}: Homework note found, but no lessonId extracted for {subject_code} on {iso_date}")
 
-
-                         # --- Assemble Event Dictionary ---
+                         # --- Assemble Event ---
                          try:
-                             event = {
-                                 "title": subject_code,
-                                 "level": level,
-                                 "year": format_academic_year(year_code), # Format '2425' -> '2024-2025'
-                                 "date": iso_date,
-                                 "dayOfWeek": day_en, # Use translated day name
-                                 "teacher": (
-                                     teacher_full.split(" (")[0] # Clean up name if initials are appended
-                                     if " (" in teacher_full
-                                     else teacher_full
-                                 ),
-                                 "teacherShort": teacher_short,
-                                 "location": location,
-                                 "timeSlot": time_info["slot"],
-                                 "startTime": start_time,
-                                 "endTime": end_time,
-                                 "timeRange": time_info["time"],
-                                 "cancelled": is_cancelled,
-                                 "lessonId": lesson_id,
-                                 "hasHomeworkNote": has_homework_note,
-                                 "description": None, # Placeholder for homework text (added later)
+                             event_data = {
+                                 "title": subject_code, "level": level, "year": format_academic_year(year_code),
+                                 "date": iso_date, "dayOfWeek": day_en,
+                                 "teacher": (teacher_full.split(" (")[0] if " (" in teacher_full else teacher_full),
+                                 "teacherShort": teacher_short, "location": location,
+                                 "timeSlot": time_info["slot"], "startTime": start_time, "endTime": end_time,
+                                 "timeRange": time_info["time"], "cancelled": is_cancelled,
+                                 "lessonId": lesson_id, "hasHomeworkNote": has_homework_note,
+                                 "description": None,
                              }
-                             log.debug(f"        Assembled event dictionary: {event}") # Log the event before appending
-                             timetable_data["events"].append(event)
-                             log.debug(f"        Successfully appended event for {subject_code}")
+                             # // TDD Anchor: Test parse with partial data warnings
+                             # Raise error if critical data is missing (e.g., date, times) before creating Event
+                             if not iso_date or not start_time or not end_time:
+                                 raise ValueError(f"Missing critical date/time info (Date: {iso_date}, Start: {start_time}, End: {end_time})")
+
+                             event = Event(**event_data)
+                             events_list.append(event)
                          except Exception as event_err:
-                             log.error(f"      ERROR assembling or appending event for cell {cell_index} ({subject_code} on {iso_date}): {event_err}", exc_info=True)
+                             # // TDD Anchor: Test parse with partial data warnings (Raise error)
+                             error_msg = f"Failed to assemble/validate event for cell {cell_index} ({subject_code} on {iso_date}): {event_err}"
+                             log.error(f"      {error_msg}", exc_info=True)
+                             # Instead of raising, append warning and continue if possible,
+                             # or return ParseFailed if it's critical
+                             warnings.append(error_msg)
+                             # Decide if this error prevents further parsing or just skips the event
+                             # For now, let's skip the event by not adding it to events_list
 
-                     else:
-                         # Log if it was identified as a lesson but didn't have enough links
-                         log.warning(f"      Cell {cell_index}: Identified as lesson based on class, but found only {len(a_tags)} links. Skipping event creation.")
-                         # Ensure we still advance the column index correctly
-                         current_col_index += colspan
-                         continue # Skip to the next cell
- 
-                     # The 'else' for 'if len(a_tags) >= 3:' is handled above by logging a warning and continuing
+                     else: # Not enough <a> tags
+                         warnings.append(f"Row {row_index}, Cell {cell_index}: Lesson cell identified, but found only {len(a_tags)} links. Skipping.")
+                         log.warning(f"      Skipping lesson cell {cell_index} in row {row_index} due to insufficient links.")
 
-                 # This 'else' corresponds to `if is_lesson:`
-                 else:
-                     log.debug(f"      Cell {cell_index}: Not identified as a lesson based on class pattern. Skipping.")
-                     # Still need to advance column index for non-lesson cells
-                     current_col_index += colspan
-                     continue # Skip to the next cell
-
-                 # --- This part is now only reached if is_lesson and len(a_tags) >= 3 ---
-
-                 # Move column index forward by the colspan of the current cell
-                 # Important: Do this *after* successfully processing a lesson cell or explicitly skipping non-lessons.
-                 # to correctly track position across empty/non-lesson cells.
+                 # Advance column index regardless of whether it was a lesson or not
                  current_col_index += colspan
-                 # log.debug(f"    Moved col index to ~{current_col_index}") # Compacted log
-                 # --- End of indented block ---
 
-            # Log row HTML *after* processing all its cells, to avoid prettify errors blocking cell logs
-            try:
-                log.debug(f"Finished processing row index {row_index}. Found {lessons_found_in_row} lesson(s). Row HTML: {row.prettify()}")
-            except Exception as prettify_err:
-                log.warning(f"Finished processing row index {row_index}. Found {lessons_found_in_row} lesson(s). Error logging row HTML: {prettify_err}")
+        # Log warnings collected during parsing
+        if warnings:
+            log.warning(f"Parsing completed with {len(warnings)} warnings:")
+            for warn_msg in warnings:
+                log.warning(f"  - {warn_msg}")
 
+        # --- Return final list of events ---
+        if events_list:
+            log.info(f"Parsing finished. Extracted {len(events_list)} events.")
+            return ParseResult(status='Success', data={'events': events_list, 'week_info': parsed_week_info, 'student_info': parsed_student_info}, warnings=warnings)
+        else:
+            log.info("Parsing finished. Valid structure found, but no events were extracted.")
+            return ParseResult(status='Success', data={'events': [], 'week_info': parsed_week_info, 'student_info': parsed_student_info}, warnings=warnings)
+
+    except (ImportError, AttributeError, TypeError, ValueError) as structure_err:
+         # Catch errors suggesting the HTML structure was invalid or unexpected by BeautifulSoup/lxml
+         msg = f"Invalid HTML structure or parsing error: {structure_err}"
+         log.error(msg, exc_info=True)
+         return ParseResult(status='StructureError', error_message=msg, warnings=warnings)
     except Exception as e:
-        log.error(f"Critical error during timetable HTML parsing: {e}", exc_info=True)
+        # Catch any other unexpected errors during parsing
+        msg = f"An unexpected error occurred during parsing: {e}"
+        log.error(msg, exc_info=True)
+        return ParseResult(status='ParseFailed', error_message=msg, warnings=warnings)
 
 
 
 
-    log.info(f"Finished parsing timetable. Found {len(timetable_data['events'])} potential events.")
-    # Use set to count unique IDs, as duplicates might occur if parsing logic has issues
-    unique_homework_ids = set(homework_ids)
-    log.info(f"Identified {len(unique_homework_ids)} unique lessons with homework notes.")
-    
-    # --- Fallback: Extract Events from Class Info if No Events Found ---
-    if len(timetable_data["events"]) == 0 and timetable_data.get("studentInfo", {}).get("class"):
-        log.warning("No events found through normal parsing. Attempting to extract from class info.")
-        class_info = timetable_data["studentInfo"]["class"]
-        
-        # Look for day headers like "Mánadagur 21/4"
-        day_matches = re.finditer(r'([A-ZÁÐÍÓÚÝÆØÅa-záðíóúýæøå]+dagur)\s+(\d{1,2}/\d{1,2})', class_info)
-        
-        for day_match in day_matches:
-            day_name_fo = day_match.group(1)
-            date_part = day_match.group(2)
-            day_en = DAY_NAME_MAPPING.get(day_name_fo, day_name_fo)
-            
-            # Find position of this day in string
-            day_pos = day_match.start()
-            next_day_match = re.search(r'[A-ZÁÐÍÓÚÝÆØÅa-záðíóúýæøå]+dagur', class_info[day_pos + 1:])
-            day_end_pos = next_day_match.start() + day_pos + 1 if next_day_match else len(class_info)
-            
-            # Extract content for this day
-            day_content = class_info[day_pos:day_end_pos]
-            
-            # Find course patterns like "før-A-33-2425-22y TJA st. 516"
-            course_matches = re.finditer(r'([a-zæøåA-ZÆØÅ]+-[A-Z]-\d+-\d{4}-\w+)\s+([A-Z]{2,4})\s+st\.\s+(\d+)', day_content)
-            
-            for i, course_match in enumerate(course_matches):
-                course_code = course_match.group(1)
-                teacher_short = course_match.group(2)
-                location = course_match.group(3)
-                
-                # Parse course info
-                code_parts = course_code.split("-")
-                subject_code = code_parts[0] if len(code_parts) > 0 else course_code
-                level = code_parts[1] if len(code_parts) > 1 else ""
-                year_code = code_parts[3] if len(code_parts) > 3 else ""
-                
-                # Create ISO date
-                iso_date = None
-                current_year = timetable_data.get("weekInfo", {}).get("year")
-                if current_year:
-                    iso_date = to_iso_date(date_part, current_year)
-                
-                # Use position in day to estimate time slot
-                time_info = get_timeslot_info((i + 1) * 10)  # Rough estimate
-                start_time, end_time = parse_time_range(time_info["time"])
-                
-                # Create event
-                teacher_full = teacher_map.get(teacher_short, teacher_short)
-                event = {
-                    "title": subject_code,
-                    "level": level,
-                    "year": format_academic_year(year_code),
-                    "date": iso_date,
-                    "dayOfWeek": day_en,
-                    "teacher": teacher_full.split(" (")[0] if " (" in teacher_full else teacher_full,
-                    "teacherShort": teacher_short,
-                    "location": location,
-                    "timeSlot": time_info["slot"],
-                    "startTime": start_time,
-                    "endTime": end_time,
-                    "timeRange": time_info["time"],
-                    "cancelled": False,
-                    "lessonId": None,  # No lesson ID available in this fallback
-                    "hasHomeworkNote": False,
-                    "description": None,
-                }
-                timetable_data["events"].append(event)
-                log.debug(f"Extracted event from class info: {subject_code} with {teacher_short} in room {location}")
-        
-        log.info(f"Extracted {len(timetable_data['events'])} events from class info as fallback.")
-    
-    # --- Add final debug log ---
-    log.debug(f"FINAL Events list contains {len(timetable_data['events'])} events.") # Log only the count
-    # --- End final debug log ---
-
-
-    # Return the list of potentially duplicate IDs as the extractor might handle duplicates
-    return timetable_data, homework_ids
 # --- Homework Merging ---
 
-def merge_homework_into_events(events: List[Dict[str, Any]], homework_map: Dict[str, str]):
+def merge_homework_into_events(events: List[Event], homework_map: Dict[str, str]): # Keep List[Event]
     """
     Merges fetched homework text into the corresponding timetable events.
 
@@ -777,21 +692,24 @@ def merge_homework_into_events(events: List[Dict[str, Any]], homework_map: Dict[
 
     merged_count = 0
     for event in events:
-        lesson_id = event.get("lessonId")
+        # Access attributes directly on the Pydantic model instance
+        lesson_id = event.lesson_id
         if lesson_id and lesson_id in homework_map:
             homework_text = homework_map[lesson_id]
-            event["description"] = homework_text
-            log.debug(f"Merged homework for lesson ID {lesson_id} into event '{event.get('title', 'N/A')}'")
+            event.description = homework_text # Modify the Pydantic model instance
+            log.debug(f"Merged homework for lesson ID {lesson_id} into event '{event.title}'")
             merged_count += 1
         elif lesson_id:
-            # Removed log for missing homework in map - too verbose. The final count is sufficient.
+            # Log if homework was expected (note present) but not found in map
+            if event.has_homework_note:
+                log.debug(f"Homework note present for lesson ID {lesson_id}, but no text found in homework_map.")
             pass # Explicitly do nothing if homework is not found for a lesson ID
 
     log.info(f"Merged homework descriptions into {merged_count} events.")
 # --- Available Weeks Offset Parser ---
 _RE_WEEK_OFFSET = re.compile(r"v=(-?\d+)") # Reverted: Extracts the offset value 'v' from onclick
 
-def parse_available_offsets(html: str) -> List[int]:
+def parse_available_offsets(html: Optional[str]) -> List[int]: # Allow Optional[str]
     """
     Parses the timetable HTML to find all available week offsets from navigation links.
 
@@ -802,10 +720,14 @@ def parse_available_offsets(html: str) -> List[int]:
         A sorted list of unique integer week offsets found in the navigation.
         Returns an empty list if parsing fails or no offsets are found.
     """
+    if not html: # Add check for empty input
+        log.warning("parse_available_offsets received empty HTML.")
+        return []
+
     offsets = set()
     try:
         soup = BeautifulSoup(html, "lxml")
-        # Find all anchor tags with an onclick attribute containing 'skemaVis('
+        # Find all anchor tags with an onclick attribute containing 'v='
         # These are typically used for week navigation.
         nav_links = soup.select('a[onclick*="v="]') # Reverted: Select links with 'v=' in onclick
 

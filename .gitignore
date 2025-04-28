@@ -1,45 +1,29 @@
-# Python
-__pycache__/
+# Environment variables & Databases
+glasir_api/.env*
+glasir_api/*.db*
+
+# Python cache & artifacts
+glasir_api/__pycache__/
+glasir_api/.pytest_cache/
 *.pyc
 *.pyo
 *.pyd
-*.egg-info/
-dist/
-build/
+*.~
 
-# Virtual environment
-venv/
-.venv/
-env/
-ENV/
+# Virtual environment (common names)
+glasir_api/venv/
+glasir_api/.venv/
+glasir_api/env/
 
-# OS specific
-.DS_Store
-
-# IDE directories
+# IDE/Editor specific directories
 .vscode/
 .idea/
 
-# Project specific
-# Ignore everything in glasir_auth_tool except get_auth.py
-glasir_auth_tool/*
-!glasir_auth_tool/get_auth.py
+# Auth tool secrets and generated files
+glasir_auth_tool/access_code.txt
+glasir_auth_tool/cookies.json
+glasir_auth_tool/student_id.txt
+glasir_auth_tool/api_response*.json
 
 # Debugging output
 debug_html/
-
-# Logs
-*.log
-
-# Profiling output
-profile_output.prof
-
-# Environment variables
-.env
-# Planning and output files
-Plan.md
-repomix-output-tree-simplified.md
-roo_task_apr-26-2025_4-07-46-pm.md
-
-# Specstory directory
-/.specstory

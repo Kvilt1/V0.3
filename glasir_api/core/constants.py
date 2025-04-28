@@ -4,6 +4,7 @@
 GLASIR_BASE_URL = "https://tg.glasir.fo"
 # Specific endpoint for the main timetable page (adjust if needed)
 GLASIR_TIMETABLE_URL = f"{GLASIR_BASE_URL}/132n/"
+GLASIR_SCHEDULE_URL = f"{GLASIR_BASE_URL}/i/udvalg.asp" # Endpoint for fetching week schedules
 # Note: Other endpoints like /i/teachers.asp, /i/udvalg.asp, /i/note.asp
 # are used directly in the client/extractor but could be defined here if preferred.
 

@@ -85,6 +85,12 @@ class TimetableExtractor:
             teacher_data = parse_teacher_html(resp.text)
             log.info(f"Successfully fetched and parsed teacher map ({len(teacher_data)} entries).")
             return teacher_data
+        except httpx.HTTPStatusError as e:
+            log.error(f"HTTP error fetching teacher map: {e}", exc_info=True)
+            return {}
+        except httpx.RequestError as e:
+            log.error(f"Network error fetching teacher map: {e}", exc_info=True)
+            return {}
         except Exception as e:
             log.error(f"Failed to fetch or parse teacher map: {e}", exc_info=True)
             # Return empty dict on failure, which will also be cached
@@ -231,14 +237,14 @@ class TimetableExtractor:
                     results[lesson_id] = parsed_homework[lesson_id]
                     # log.debug(f"Successfully fetched homework for lesson {lesson_id}") # Removed: Too verbose
                 # else:
-                    # log.debug(f"No homework found for lesson {lesson_id} after parsing.")
+                # log.debug(f"No homework found for lesson {lesson_id} after parsing.")
 
             except Exception as e:
                 log.warning(f"Failed to fetch homework for lesson {lesson_id}: {e}")
                 # Optionally log traceback: log.warning(..., exc_info=True)
 
         # Create and run tasks concurrently
-        tasks = [fetch_one(lid, force_max_concurrency) for lid in lesson_ids]
+        tasks = [fetch_one(lid, force_flag) for lid in lesson_ids]
         await asyncio.gather(*tasks)
 
         log.info(f"Finished fetching homework. Found details for {len(results)}/{len(lesson_ids)} lessons.")
