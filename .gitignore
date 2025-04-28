@@ -36,3 +36,10 @@ profile_output.prof
 
 # Environment variables
 .env
+# Planning and output files
+Plan.md
+repomix-output-tree-simplified.md
+roo_task_apr-26-2025_4-07-46-pm.md
+
+# Specstory directory
+/.specstory
