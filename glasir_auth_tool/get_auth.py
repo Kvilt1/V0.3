@@ -58,6 +58,7 @@ async def load_data() -> Tuple[Optional[str], Optional[List[Dict[str, Any]]], Op
 async def save_data(student_id: str, cookies: List[Dict[str, Any]], access_code: str) -> None:
     """Saves student_id, cookies, and access_code to local files."""
     try:
+        
         async with aiofiles.open(STUDENT_ID_FILE, "w") as f:
             await f.write(student_id)
     except Exception as e:
@@ -241,66 +242,151 @@ async def perform_session_refresh(student_id: str) -> bool:
 
 # --- API Test Logic ---
 
-async def make_api_call(access_code: str, endpoint: str, student_id: str) -> None:
+async def make_api_call(access_code: str, endpoint: str, student_id: str, fetch_full_schedule: bool = False) -> None:
     """
     Makes an API call to the specified endpoint using the access_code for authentication.
     Handles 401/cookie expiration by attempting automatic refresh.
+    If fetch_full_schedule is True:
+        - If current_weeks.json is missing/invalid, fetches 'weeks/all' as baseline.
+        - Otherwise, fetches the specified endpoint and saves to current_weeks.json only if changed.
     """
-    if not all([access_code, student_id]):
+    if not all([access_code, student_id, endpoint]):
         print("Missing data for API call. Skipping.")
         return
 
-    # Build endpoint URL and output file
-    if endpoint == "week/0":
-        api_url = f"{API_BASE}/sync"
-        body = {"student_id": student_id, "offsets": [0]}
-        output_filename = SCRIPT_DIR / "api_response_week_0.json"
-    elif endpoint == "weeks/all":
-        api_url = f"{API_BASE}/sync"
-        body = {"student_id": student_id, "offsets": "all"}
-        output_filename = SCRIPT_DIR / "api_response_all.json"
-    elif endpoint == "weeks/current_forward":
-        api_url = f"{API_BASE}/sync"
-        body = {"student_id": student_id, "offsets": "current_forward"}
-        output_filename = SCRIPT_DIR / "api_response_current_forward.json"
-    elif endpoint.startswith("weeks/forward/"):
+    original_endpoint = endpoint # Store the originally requested endpoint
+    api_url = None
+    body = None
+    output_filename = None
+
+    # --- Logic for Fetch Full Schedule Mode ---
+    if fetch_full_schedule:
+        loaded_data = None
+        needs_baseline_fetch = False
         try:
-            count_str = endpoint.split('/')[-1]
-            count = int(count_str)
-            if count < 0:
-                print("Error: Count for forward weeks cannot be negative.")
-                return
+            if await aiofiles.os.path.exists(CURRENT_WEEKS_FILE):
+                async with aiofiles.open(CURRENT_WEEKS_FILE, "r", encoding='utf-8') as f:
+                    loaded_data = json.loads(await f.read())
+            else:
+                needs_baseline_fetch = True
+                print(f"'{CURRENT_WEEKS_FILE}' not found. Will fetch baseline ('weeks/all').")
+        except (json.JSONDecodeError, Exception) as e:
+            needs_baseline_fetch = True
+            print(f"Warning: Error reading/parsing existing '{CURRENT_WEEKS_FILE}': {e}. Will fetch baseline ('weeks/all').")
+
+        if needs_baseline_fetch:
+            # Override endpoint to fetch the baseline 'weeks/all'
+            endpoint_to_call = "weeks/all"
+            print(f"Fetching baseline data from endpoint: {endpoint_to_call}")
             api_url = f"{API_BASE}/sync"
-            body = {"student_id": student_id, "offsets": list(range(count))}
-            output_filename = SCRIPT_DIR / f"api_response_forward_{count}.json"
-        except (ValueError, IndexError):
-            print(f"Error: Invalid format for forward weeks endpoint: {endpoint}")
-            return
+            body = {"student_id": student_id, "offsets": "all"}
+            output_filename = CURRENT_WEEKS_FILE # Always save baseline
+        else:
+            # Use the originally requested endpoint for comparison
+            endpoint_to_call = original_endpoint
+            print(f"Fetching data from requested endpoint for comparison: {endpoint_to_call}")
+            # Parse the original endpoint to get api_url and body
+            if original_endpoint == "week/0":
+                 api_url = f"{API_BASE}/sync"; body = {"student_id": student_id, "offsets": [0]}
+            elif original_endpoint == "weeks/all":
+                 api_url = f"{API_BASE}/sync"; body = {"student_id": student_id, "offsets": "all"}
+            elif original_endpoint == "weeks/current_forward":
+                 api_url = f"{API_BASE}/sync"; body = {"student_id": student_id, "offsets": "current_forward"}
+            elif original_endpoint.startswith("weeks/forward/"):
+                 try:
+                     count = int(original_endpoint.split('/')[-1])
+                     if count < 0: raise ValueError("Count cannot be negative")
+                     api_url = f"{API_BASE}/sync"; body = {"student_id": student_id, "offsets": list(range(count))}
+                 except (ValueError, IndexError):
+                     print(f"Error: Invalid format for forward weeks endpoint: {original_endpoint}")
+                     return
+            else:
+                 print(f"Error: Unknown original endpoint '{original_endpoint}' during fetch logic.")
+                 return
+            output_filename = CURRENT_WEEKS_FILE # Target file for potential update
+
+    # --- Logic for Diff Mode (or if fetch_full_schedule is False) ---
     else:
-        print(f"Error: Unknown endpoint '{endpoint}'.")
-        return
+        endpoint_to_call = original_endpoint # Use the provided endpoint
+        # Parse endpoint to determine URL, body, and specific output file
+        if endpoint_to_call == "week/0":
+            api_url = f"{API_BASE}/sync"
+            body = {"student_id": student_id, "offsets": [0]}
+            output_filename = SCRIPT_DIR / "api_response_week_0.json"
+        elif endpoint_to_call == "weeks/all":
+            api_url = f"{API_BASE}/sync"
+            body = {"student_id": student_id, "offsets": "all"}
+            output_filename = SCRIPT_DIR / "api_response_all.json"
+        elif endpoint_to_call == "weeks/current_forward":
+            api_url = f"{API_BASE}/sync"
+            body = {"student_id": student_id, "offsets": "current_forward"}
+            output_filename = SCRIPT_DIR / "api_response_current_forward.json"
+        elif endpoint_to_call.startswith("weeks/forward/"):
+            try:
+                count_str = endpoint_to_call.split('/')[-1]
+                count = int(count_str)
+                if count < 0:
+                    print(f"Error: Count for forward weeks cannot be negative ({count}).")
+                    return
+                api_url = f"{API_BASE}/sync"
+                body = {"student_id": student_id, "offsets": list(range(count))}
+                output_filename = SCRIPT_DIR / f"api_response_forward_{count}.json"
+            except (ValueError, IndexError):
+                print(f"Error: Invalid format for forward weeks endpoint: {endpoint_to_call}")
+                return
+        else:
+            print(f"Error: Unknown endpoint '{endpoint_to_call}'.")
+            return
+
+    # --- Execute API Call ---
+    if not api_url or not body:
+         print("Error: Could not determine API URL or body.")
+         return
 
     headers = {"X-Access-Code": access_code}
-    print(f"Target Endpoint: {endpoint}")
+    print(f"Target Endpoint: {endpoint_to_call} {'(Fetching Full Schedule)' if fetch_full_schedule else '(Fetching Diffs)'}")
     print(f"Output File: {output_filename}")
 
     try:
         async with httpx.AsyncClient() as client:
             print(f"Sending POST request to: {api_url}")
-            response = await client.post(api_url, headers=headers, json=body, timeout=30.0)
+            response = await client.post(api_url, headers=headers, json=body, timeout=60.0) # Increased timeout
             print(f"API Response Status Code: {response.status_code}")
 
             if response.status_code == 200:
                 try:
                     response_data = response.json()
-                    print("\nAPI Response (JSON):")
-                    print(json.dumps(response_data, indent=2))
-                    try:
-                        async with aiofiles.open(output_filename, "w", encoding='utf-8') as f:
-                            await f.write(json.dumps(response_data, indent=2, ensure_ascii=False))
-                        print(f"\nAPI response saved to {output_filename}")
-                    except Exception as e:
-                        print(f"\nError saving API response to {output_filename}: {e}")
+                    print("\nAPI Response received successfully.")
+
+                    if fetch_full_schedule:
+                        if needs_baseline_fetch:
+                            print(f"Saving baseline data to '{CURRENT_WEEKS_FILE}'.")
+                            try:
+                                 async with aiofiles.open(CURRENT_WEEKS_FILE, "w", encoding='utf-8') as f:
+                                     await f.write(json.dumps(response_data, indent=2, ensure_ascii=False))
+                                 print(f"Successfully saved baseline schedule to {CURRENT_WEEKS_FILE}")
+                            except Exception as e:
+                                 print(f"\nError saving baseline schedule to {CURRENT_WEEKS_FILE}: {e}")
+                        else:
+                            # Compare with loaded_data
+                            if response_data == loaded_data:
+                                print(f"No schedule changes detected compared to '{CURRENT_WEEKS_FILE}'. File remains unchanged.")
+                            else:
+                                print(f"Schedule changes detected. Updating '{CURRENT_WEEKS_FILE}'.")
+                                try:
+                                    async with aiofiles.open(CURRENT_WEEKS_FILE, "w", encoding='utf-8') as f:
+                                        await f.write(json.dumps(response_data, indent=2, ensure_ascii=False))
+                                    print(f"Successfully updated schedule in {CURRENT_WEEKS_FILE}")
+                                except Exception as e:
+                                    print(f"\nError updating schedule in {CURRENT_WEEKS_FILE}: {e}")
+                    else: # Original diff mode: save to specific file
+                        try:
+                            async with aiofiles.open(output_filename, "w", encoding='utf-8') as f:
+                                await f.write(json.dumps(response_data, indent=2, ensure_ascii=False))
+                            print(f"\nAPI diff response saved to {output_filename}")
+                        except Exception as e:
+                            print(f"\nError saving API diff response to {output_filename}: {e}")
+
                 except json.JSONDecodeError:
                     print("\nError: Could not decode JSON response from API.")
                     print("Response Text:", response.text)
@@ -310,27 +396,30 @@ async def make_api_call(access_code: str, endpoint: str, student_id: str) -> Non
                     data = response.json()
                     if data.get("error_code") == "COOKIES_EXPIRED":
                         print("Session expired. Attempting automatic refresh...")
-                        student_id, _, _ = await load_data()
-                        if not student_id:
+                        # Need student_id for refresh, load it if not already available
+                        current_student_id, _, _ = await load_data()
+                        if not current_student_id:
                             print("No student_id found for refresh.")
                             return
-                        success = await perform_session_refresh(student_id)
+                        success = await perform_session_refresh(current_student_id)
                         if success:
                             print("Refresh successful. Retrying API call...")
                             _, _, new_access_code = await load_data()
                             if new_access_code:
-                                await make_api_call(new_access_code, endpoint, student_id)
+                                # Retry with the original endpoint and mode
+                                await make_api_call(new_access_code, original_endpoint, current_student_id, fetch_full_schedule)
                             else:
                                 print("Could not load new access code after refresh.")
                         else:
                             print("Automatic refresh failed. Please run with --refresh manually.")
-                        return
-                except Exception:
-                    pass
+                        return # Exit after handling refresh attempt
+                except Exception as e:
+                    print(f"Error processing 401 response: {e}") # Log potential JSON errors etc.
+                    pass # Fall through to generic 401 message if parsing fails
                 print("\nAPI request failed with 401 Unauthorized.")
                 print("Response Text:", response.text)
             else:
-                print("\nAPI request failed.")
+                print(f"\nAPI request failed with status code {response.status_code}.")
                 print("Response Text:", response.text)
 
     except httpx.RequestError as exc:
@@ -425,8 +514,17 @@ async def main():
                 print("\nOperation cancelled by user.")
                 return
         endpoints_to_call = ["week/0", "weeks/all", "weeks/current_forward", f"weeks/forward/{count}"]
+
+        for endpoint in endpoints_to_call:
+            print(f"\n--- Calling Endpoint: {endpoint} ---")
+            await make_api_call(access_code, endpoint, student_id) # Always diff mode now
+            if endpoint != endpoints_to_call[-1]:
+                print("\nWaiting a moment before next test...")
+                await asyncio.sleep(2)
     else:
-        print("\nSelect the API endpoint to call:")
+        # --- Interactive Endpoint Selection Flow (Diff Mode) ---
+        endpoints_to_call = []
+        print("\nSelect the API endpoint to call (Diff Mode):")
         print("  1: week/0 (Default single week)")
         print("  2: weeks/all (All available weeks)")
         print("  3: weeks/current_forward (Current and future weeks)")
@@ -468,16 +566,13 @@ async def main():
                 print("\nOperation cancelled by user.")
                 return
 
-    # --- API Call(s) ---
-    if not endpoints_to_call:
-        print("No endpoint selected or specified. Exiting.")
-    else:
-        for endpoint in endpoints_to_call:
-            print(f"\n--- Calling Endpoint: {endpoint} ---")
-            await make_api_call(access_code, endpoint, student_id)
-            if args.test_all and endpoint != endpoints_to_call[-1]:
-                print("\nWaiting a moment before next test...")
-                await asyncio.sleep(2)
+        # --- API Call(s) for Interactive Mode ---
+        if not endpoints_to_call:
+            print("No endpoint selected. Exiting.")
+        else:
+            for endpoint in endpoints_to_call:
+                print(f"\n--- Calling Endpoint: {endpoint} ---")
+                await make_api_call(access_code, endpoint, student_id) # Always diff mode now
 
     print("\nScript finished.")
 
