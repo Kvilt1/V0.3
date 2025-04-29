@@ -27,3 +27,10 @@ glasir_auth_tool/api_response*.json
 
 # Debugging output
 debug_html/
+glasir_data.db
+i.ical
+week_0_20250425_235458_200.html
+.specstory/.what-is-this.md
+ext.py
+docs/global-memory-bank/tags/index.json
+week.html

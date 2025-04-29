@@ -492,7 +492,7 @@ def parse_week_html(
             first_cell = cells[0]
             first_cell_text = first_cell.get_text(separator=" ", strip=True)
             day_match = _RE_DAY_DATE.match(first_cell_text)
-            is_day_header = "lektionslinje_1" in first_cell.get("class", []) or "lektionslinje_1_aktuel" in first_cell.get("class", [])
+            is_day_header = ("lektionslinje_1" in first_cell.get("class", []) or "lektionslinje_1_aktuel" in first_cell.get("class", [])) and len(cells) <= 2
 
             if is_day_header:
                 # Only attempt regex match if the text is not empty

@@ -34,17 +34,19 @@ class TimetableExtractor:
     using an AsyncApiClient.
     """
 
-    def __init__(self, api_client: AsyncApiClient, lname: Optional[str] = None):
+    def __init__(self, api_client: AsyncApiClient, lname: Optional[str] = None, save_debug_html: bool = False):
         """
         Initializes the TimetableExtractor.
 
         Args:
             api_client: An instance of AsyncApiClient configured for the Glasir API.
             lname: The extracted 'lname' session parameter.
+            save_debug_html: If True, saves raw HTML responses to the 'debug_html' directory. Defaults to False.
         """
         self.api = api_client
         self.lname = lname # Store lname
-        log.info(f"TimetableExtractor initialized with lname: {self.lname}")
+        self.save_debug_html = save_debug_html # Store the flag
+        log.info(f"TimetableExtractor initialized with lname: {self.lname}, save_debug_html: {self.save_debug_html}")
 
     @cached(teacher_cache)
     async def fetch_teacher_map(self) -> Dict[str, str]:
@@ -71,17 +73,18 @@ class TimetableExtractor:
                 data=data
                 # inject_params removed
             )
-            # --- Add HTML saving ---
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            filename = DEBUG_HTML_DIR / f"teachers_{timestamp}_{resp.status_code}.html"
-            try:
-                async with aiofiles.open(filename, "w", encoding='utf-8') as f:
-                    await f.write(f"<!-- URL: {resp.url} -->\n<!-- Status: {resp.status_code} -->\n{resp.text}")
-                log.info(f"Saved debug HTML for teacher map to {filename}")
-            except Exception as save_err:
-                log.error(f"Failed to save debug HTML for teacher map: {save_err}")
+            # --- Add HTML saving (conditional) ---
+            if self.save_debug_html:
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                filename = DEBUG_HTML_DIR / f"teachers_{timestamp}_{resp.status_code}.html"
+                try:
+                    async with aiofiles.open(filename, "w", encoding='utf-8') as f:
+                        await f.write(f"<!-- URL: {resp.url} -->\n<!-- Status: {resp.status_code} -->\n{resp.text}")
+                    log.info(f"Saved debug HTML for teacher map to {filename}")
+                except Exception as save_err:
+                    log.error(f"Failed to save debug HTML for teacher map: {save_err}")
             # --- End HTML saving ---
-            resp.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx) AFTER saving HTML
+            resp.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
             teacher_data = parse_teacher_html(resp.text)
             log.info(f"Successfully fetched and parsed teacher map ({len(teacher_data)} entries).")
             return teacher_data
@@ -141,17 +144,18 @@ class TimetableExtractor:
             )
             # Log response headers
             log.debug(f"Response headers for week {offset}: {resp.headers}")
-            # --- Add HTML saving ---
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            filename = DEBUG_HTML_DIR / f"week_{offset}_{timestamp}_{resp.status_code}.html"
-            try:
-                async with aiofiles.open(filename, "w", encoding='utf-8') as f:
-                    await f.write(f"<!-- URL: {resp.url} -->\n<!-- Status: {resp.status_code} -->\n{resp.text}")
-                log.info(f"Saved debug HTML for week {offset} to {filename}")
-            except Exception as save_err:
-                log.error(f"Failed to save debug HTML for week {offset}: {save_err}")
+            # --- Add HTML saving (conditional) ---
+            if self.save_debug_html:
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                filename = DEBUG_HTML_DIR / f"week_{offset}_{timestamp}_{resp.status_code}.html"
+                try:
+                    async with aiofiles.open(filename, "w", encoding='utf-8') as f:
+                        await f.write(f"<!-- URL: {resp.url} -->\n<!-- Status: {resp.status_code} -->\n{resp.text}")
+                    log.info(f"Saved debug HTML for week {offset} to {filename}")
+                except Exception as save_err:
+                    log.error(f"Failed to save debug HTML for week {offset}: {save_err}")
             # --- End HTML saving ---
-            # Check for redirect *after* saving, before returning text
+            # Check for redirect *after* potential saving, before returning text
             if resp.status_code >= 300 and resp.status_code < 400:
                  log.warning(f"Received redirect status {resp.status_code} for week {offset}. Content might be login page.")
                  # Optionally raise an error here or let the parser fail later
@@ -213,17 +217,18 @@ class TimetableExtractor:
                     concurrency_manager=concurrency_manager,
                     force_max_concurrency=force_flag,
                 )
-                # --- Add HTML saving ---
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                filename = DEBUG_HTML_DIR / f"homework_{lesson_id}_{timestamp}_{resp.status_code}.html"
-                try:
-                    async with aiofiles.open(filename, "w", encoding='utf-8') as f:
-                        await f.write(f"<!-- URL: {resp.url} -->\n<!-- Status: {resp.status_code} -->\n{resp.text}")
-                    log.info(f"Saved debug HTML for homework {lesson_id} to {filename}")
-                except Exception as save_err:
-                    log.error(f"Failed to save debug HTML for homework {lesson_id}: {save_err}")
+                # --- Add HTML saving (conditional) ---
+                if self.save_debug_html:
+                    timestamp = time.strftime("%Y%m%d_%H%M%S")
+                    filename = DEBUG_HTML_DIR / f"homework_{lesson_id}_{timestamp}_{resp.status_code}.html"
+                    try:
+                        async with aiofiles.open(filename, "w", encoding='utf-8') as f:
+                            await f.write(f"<!-- URL: {resp.url} -->\n<!-- Status: {resp.status_code} -->\n{resp.text}")
+                        log.info(f"Saved debug HTML for homework {lesson_id} to {filename}")
+                    except Exception as save_err:
+                        log.error(f"Failed to save debug HTML for homework {lesson_id}: {save_err}")
                 # --- End HTML saving ---
-                # Check for redirect *after* saving
+                # Check for redirect *after* potential saving
                 if resp.status_code >= 300 and resp.status_code < 400:
                     log.warning(f"Received redirect status {resp.status_code} for homework {lesson_id}. Content might be login page.")
                     # Skip parsing if redirected
@@ -244,7 +249,8 @@ class TimetableExtractor:
                 # Optionally log traceback: log.warning(..., exc_info=True)
 
         # Create and run tasks concurrently
-        tasks = [fetch_one(lid, force_flag) for lid in lesson_ids]
+        # Pass the force_max_concurrency flag to each fetch_one task
+        tasks = [fetch_one(lid, force_max_concurrency) for lid in lesson_ids]
         await asyncio.gather(*tasks)
 
         log.info(f"Finished fetching homework. Found details for {len(results)}/{len(lesson_ids)} lessons.")

@@ -120,17 +120,47 @@ async def fetch_and_parse_single_week(
                 # Extract events list - it should already contain Event objects from the parser
                 events_parsed = parsed_dict.get('events', [])
                 # No need to re-validate here if parser already creates Event objects
-                events_obj_list = events_parsed # Directly use the list from the parser
+                events_obj_list: List[Event] = events_parsed # Directly use the list from the parser
 
-                # Assemble the final TimetableData
+                # --- Fetch and Merge Homework ---
+                homework_lesson_ids = [
+                    event.lesson_id
+                    for event in events_obj_list
+                    if event.lesson_id and event.has_homework_note
+                ]
+                if homework_lesson_ids:
+                    log.debug(f"Service: Fetching homework for {len(homework_lesson_ids)} lessons in offset {offset}...")
+                    try:
+                        # Use the same extractor instance passed into the function
+                        homework_map = await extractor.fetch_homework_for_lessons(
+                            lesson_ids=homework_lesson_ids,
+                            student_id=student_id # Pass student_id if needed by extractor logic
+                        )
+                        if homework_map:
+                             log.debug(f"Service: Merging homework for offset {offset}...")
+                             # merge_homework_into_events modifies the events_obj_list in place
+                             merge_homework_into_events(events_obj_list, homework_map)
+                             log.debug(f"Service: Homework merge complete for offset {offset}.")
+                        else:
+                             log.debug(f"Service: No homework details returned for offset {offset}.")
+                    except Exception as hw_exc:
+                         log.error(f"Service: Failed to fetch or merge homework for offset {offset}: {hw_exc}", exc_info=True)
+                         # Optionally add a warning, but don't fail the whole week parse
+                         warnings.append(f"Homework fetching/merging failed: {hw_exc}")
+                else:
+                     log.debug(f"Service: No lessons with homework notes found for offset {offset}.")
+                # --- End Fetch and Merge Homework ---
+
+
+                # Assemble the final TimetableData (using the potentially modified events_obj_list)
                 timetable_data = TimetableData(
                     studentInfo=student_info_obj, # Use Pydantic field name
                     weekInfo=week_info_obj,       # Use Pydantic field name
-                    events=events_obj_list
+                    events=events_obj_list        # This list now includes descriptions
                     # formatVersion defaults to 2
                 )
 
-                log.debug(f"Service: Successfully validated TimetableData for offset {offset}.")
+                log.debug(f"Service: Successfully validated TimetableData (with homework) for offset {offset}.")
                 status = 'SuccessWithData' if timetable_data.events else 'SuccessNoData'
                 return WeekDataResult(status=status, data=timetable_data, warnings=warnings)
 

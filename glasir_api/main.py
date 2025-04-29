@@ -814,13 +814,16 @@ async def refresh_session(
     # --- 3. Query UserSession by student_id ---
     try:
         query = UserSession.__table__.select().where(UserSession.__table__.c.student_id == student_id) # Use Class.__table__
-        session = await db.fetch_one(query)
-        if not session:
+        # Use fetch_all as a workaround for potential bug in databases.fetch_one on empty table
+        sessions = await db.fetch_all(query)
+        if not sessions: # Check if the list is empty
             log.warning(f"Session refresh attempt failed: User session not found for student_id {student_id}.")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"User session not found for student ID {student_id}."
             )
+        # If found, proceed (assuming only one session per student_id)
+        session = sessions[0] # Get the first (and should be only) session record
     except Exception as e:
         log.error(f"Database error checking for session during refresh for student {student_id}: {e}", exc_info=True)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error checking user session.")
